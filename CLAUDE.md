@@ -35,4 +35,5 @@ Anyone curious enough to try it, any skill level. No security background require
 ## Repo
 - GitHub: https://github.com/kmdn-ch/phantom-ethical-redteam (public)
 - Owner: KMDN (Switzerland)
-- Working directory: `C:\Users\User\phantom-ethical-redteam`
+- Working directory: `/home/noir/phantom-ethical-redteam`
+

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "phantom": {
+      "type": "stdio",
+      "command": "/home/noir/phantom-ethical-redteam/.venv/bin/python",
+      "args": [
+        "/home/noir/phantom-ethical-redteam/mcp_bridge.py"
+      ],
+      "env": {
+        "PYTHONPATH": "/home/noir/phantom-ethical-redteam/agent:/home/noir/phantom-ethical-redteam"
+      }
+    }
+  }
+}
