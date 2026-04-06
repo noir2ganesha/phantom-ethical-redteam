@@ -40,6 +40,9 @@ class TestClassify:
     def test_connection_refused(self, handler):
         assert handler.classify("Connection refused") == ErrorType.CONNECTION_REFUSED
         assert handler.classify("ECONNREFUSED 10.0.0.1:80") == ErrorType.CONNECTION_REFUSED
+        assert handler.classify("connection reset by peer") == ErrorType.CONNECTION_REFUSED
+        assert handler.classify("host unreachable") == ErrorType.CONNECTION_REFUSED
+        assert handler.classify("network unreachable") == ErrorType.CONNECTION_REFUSED
 
     def test_authentication_failed(self, handler):
         assert handler.classify("Authentication failed for user admin") == ErrorType.AUTHENTICATION_FAILED
@@ -66,6 +69,7 @@ class TestClassify:
         assert handler.classify("SSL certificate verify failed") == ErrorType.SSL_CERTIFICATE_ERROR
         assert handler.classify("CERTIFICATE_VERIFY_FAILED") == ErrorType.SSL_CERTIFICATE_ERROR
         assert handler.classify("SSL handshake error") == ErrorType.SSL_CERTIFICATE_ERROR
+        assert handler.classify("TLS handshake failure") == ErrorType.SSL_CERTIFICATE_ERROR
 
     def test_service_unavailable(self, handler):
         assert handler.classify("503 Service Unavailable") == ErrorType.SERVICE_UNAVAILABLE

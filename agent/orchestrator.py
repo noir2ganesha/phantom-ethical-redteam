@@ -835,12 +835,16 @@ class Orchestrator:
 
             # ErrorHandler: classify and log recovery suggestion (Sprint 1)
             result_str = str(result)
+            _lower = result_str.lower()[:200]
             if self._error_handler and result_str and (
-                "error" in result_str.lower()[:200]
-                or "fail" in result_str.lower()[:200]
-                or "denied" in result_str.lower()[:200]
-                or "refused" in result_str.lower()[:200]
-                or "timeout" in result_str.lower()[:200]
+                "error" in _lower
+                or "fail" in _lower
+                or "denied" in _lower
+                or "refused" in _lower
+                or "timeout" in _lower
+                or "timed out" in _lower
+                or "unreachable" in _lower
+                or "blocked" in _lower
             ):
                 from execution.error_handler import ErrorType
 

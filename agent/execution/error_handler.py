@@ -132,10 +132,10 @@ class ErrorHandler:
         (re.compile(r"WAF|blocked by.*WAF|cloudflare|ModSecurity|403 Forbidden", re.IGNORECASE), ErrorType.WAF_BLOCKED),
         (re.compile(r"rate limit|429|too many requests", re.IGNORECASE), ErrorType.RATE_LIMITED),
         (re.compile(r"cannot resolve|Name or service not known|NXDOMAIN", re.IGNORECASE), ErrorType.DNS_RESOLUTION_FAILED),
-        (re.compile(r"SSL|certificate verify failed|CERTIFICATE_VERIFY_FAILED", re.IGNORECASE), ErrorType.SSL_CERTIFICATE_ERROR),
+        (re.compile(r"SSL|TLS handshake|certificate verify failed|CERTIFICATE_VERIFY_FAILED", re.IGNORECASE), ErrorType.SSL_CERTIFICATE_ERROR),
         (re.compile(r"502 Bad Gateway|503 Service Unavailable|service unavailable", re.IGNORECASE), ErrorType.SERVICE_UNAVAILABLE),
         (re.compile(r"command not found|No such file", re.IGNORECASE), ErrorType.TOOL_NOT_FOUND),
-        (re.compile(r"connection refused|ECONNREFUSED", re.IGNORECASE), ErrorType.CONNECTION_REFUSED),
+        (re.compile(r"connection refused|ECONNREFUSED|connection reset|host unreachable|network unreachable", re.IGNORECASE), ErrorType.CONNECTION_REFUSED),
         (re.compile(r"authentication failed|login failed|invalid credentials|invalid.*password|invalid.*username", re.IGNORECASE), ErrorType.AUTHENTICATION_FAILED),
         # Generic "permission denied/forbidden" LAST among access-control patterns
         (re.compile(r"permission denied|access denied|forbidden", re.IGNORECASE), ErrorType.PERMISSION_DENIED),
