@@ -141,6 +141,15 @@ class Orchestrator:
             logger.warning("HypothesisEngine not available: %s", exc)
             self._hypothesis_engine = None
 
+        # ------ Error handler (Sprint 1) ------
+        try:
+            from execution.error_handler import ErrorHandler
+
+            self._error_handler: Optional[Any] = ErrorHandler()
+        except Exception as exc:
+            logger.warning("ErrorHandler not available: %s", exc)
+            self._error_handler = None
+
         # ------ Mission state machine ------
         self.mission_state = MissionState(mission_id=self.mission_id)
 
@@ -824,10 +833,33 @@ class Orchestrator:
                 tool_duration_ms=duration_ms,
             )
 
+            # ErrorHandler: classify and log recovery suggestion (Sprint 1)
+            result_str = str(result)
+            if self._error_handler and result_str and (
+                "error" in result_str.lower()[:200]
+                or "fail" in result_str.lower()[:200]
+                or "denied" in result_str.lower()[:200]
+                or "refused" in result_str.lower()[:200]
+                or "timeout" in result_str.lower()[:200]
+            ):
+                from execution.error_handler import ErrorType
+
+                error_type = self._error_handler.classify(result_str, tc["name"])
+                if error_type != ErrorType.UNKNOWN:
+                    recovery = self._error_handler.recover(
+                        error_type, {"tool": tc["name"], "input": tool_input}
+                    )
+                    logger.info(
+                        "ErrorHandler: %s -> %s: %s",
+                        error_type.value,
+                        recovery.action.value,
+                        recovery.suggestion,
+                    )
+
             return {
                 "type": "tool_result",
                 "tool_use_id": tc["id"],
-                "content": str(result),
+                "content": result_str,
             }
         except Exception as exc:
             duration_ms = int((time.monotonic() - start_time) * 1000)
