@@ -452,9 +452,8 @@ ErrorHandlerは段階的に機能を拡張する設計であり、一度に全�
 | スプリント | 実装内容 | 効果 |
 |---|---|---|
 | スプリント1 | エラー分類（13型）+ 回復提案（7種）をログに記録するのみ。自動リトライは行わない。Orchestratorの`_execute_tool()`に分類・ログを追加 | エラーの見える化。Claudeへのtool_resultにはエラー文字列がそのまま返り、Claudeの次ターン判断に委ねる。人間やClaudeが回復提案をログから参照できる |
-| スプリント2 | ErrorHandlerの分類結果をStateStoreに記録。エラー履歴の蓄積が可能に | 「同じツールが同じターゲットで3回連続TIMEOUT」等のパターンを検出可能 |
-| スプリント5 | 事前バリデーション（PreValidator）がStateStoreのエラー履歴を参照。過去に失敗したツール+パラメータの組合せを事前に警告 | 同じ失敗の繰り返しを予防 |
-| スプリント7 | EGATS統合後、ErrorHandlerの分類結果をバックプロパゲーションに連携。`AUTHENTICATION_FAILED`→ノードのpromise_score低下→TDI上昇→自動枝刈り→別ノードにピボット。`RETRY_WITH_DELAY`→同ノードで待機後リトライ。`SWITCH_TOOL`→同ノード内で代替ツールを選択 | **自動的な攻撃方針転換**。kobold.htbのF3（Arcane認証13分行き詰まり）はErrorHandler+EGATSの連携で自動ピボットされる |
+| スプリント5 | 事前バリデーション（PreValidator）が直前のエラー分類結果を参照。同一ツール+同一ターゲットで直前に失敗したパターンを事前に警告 | 同じ失敗の繰り返しを予防 |
+| スプリント7 | EGATS統合後、ErrorHandlerの分類結果をバックプロパゲーションに連携。既存の `ActionRecord` に `error_type: str` フィールドを追加し、エラー種別を記録。`AUTHENTICATION_FAILED`→ノードのpromise_score低下→TDI上昇→自動枝刈り→別ノードにピボット。`RETRY_WITH_DELAY`→同ノードで待機後リトライ。`SWITCH_TOOL`→同ノード内で代替ツールを選択 | **自動的な攻撃方針転換**。kobold.htbのF3（Arcane認証13分行き詰まり）はErrorHandler+EGATSの連携で自動ピボットされる |
 | スプリント9以降 | RAG StrategyMemoryと連携。ErrorHandlerが`get_failure_recovery()`で過去の回復パターンを検索し、パターンベースより精度の高い回復提案を返す | 過去のセッションで学んだ回復方法（例: TLS 1.2フォールバック）を自動適用 |
 
 **つまりErrorHandlerは単体でも有用（エラーの体系的分類と見える化）だが、EGATS（スプリント7）およびRAG（スプリント9以降）と組み合わさることで真価を発揮する。**
@@ -1096,71 +1095,158 @@ if self._error_handler and result and "error" in str(result).lower():
 
 **他コンポーネントへの依存**: なし
 
-**DB層設計（PostgreSQL + SQLiteフォールバック）**:
+**DB設計方針**:
 
-```python
-# agent/memory/db.py — 全スプリントで共用するDB接続管理
-class DatabaseManager:
-    def __init__(self, db_url: str):
-        # db_url = "postgresql://user:pass@host/dbname" → psycopg2
-        # db_url = "sqlite:///path/to/file.db" → sqlite3
-        # db_url = ":memory:" → sqlite3 インメモリ
+StateStore（セッション内）とRAG（セッション間）は異なるDB要件を持つため、共通のDB抽象化レイヤーは設けない。
 
-    def execute(self, sql: str, params: tuple = ()) -> list
-    def executemany(self, sql: str, params_list: list) -> None
-    def init_schema(self, schema_sql: str) -> None
-```
+| コンポーネント | DB | 理由 |
+|---|---|---|
+| StateStore（スプリント2） | **SQLite**（インメモリまたはファイル） | セッション内の軽量データ。外部依存なし。Excaliburと同じ設計 |
+| RAG（スプリント9） | **PostgreSQL + pgvector** | 永続的な大規模データ+ベクトル類似検索。Nirvanaと同じ設計 |
 
-**スキーマ設計（全スプリントのテーブルを一括設計、作成は各スプリントで）**:
+SQLiteとPostgreSQLはSQL方言が異なり（`?` vs `%s`、`SERIAL` vs `INTEGER`、`vector(768)` 型等）、共通抽象化は過剰設計となる。
+
+**StateStoreスキーマ（スプリント2で作成、SQLite）**:
 
 ```sql
--- スプリント2で作成
-CREATE TABLE IF NOT EXISTS hosts (...);
-CREATE TABLE IF NOT EXISTS services (...);
-CREATE TABLE IF NOT EXISTS credentials (...);
-CREATE TABLE IF NOT EXISTS sessions (...);
-CREATE TABLE IF NOT EXISTS vulnerabilities (...);
+CREATE TABLE IF NOT EXISTS hosts (
+    id TEXT PRIMARY KEY,
+    ip_address TEXT NOT NULL,
+    hostname TEXT,
+    os_fingerprint TEXT,
+    discovered_at TEXT NOT NULL,
+    discovery_node_id TEXT
+);
 
--- スプリント9で作成（スキーマのみ先行設計）
--- CREATE TABLE IF NOT EXISTS attacks (...);
--- CREATE TABLE IF NOT EXISTS strategies (...);
--- CREATE TABLE IF NOT EXISTS meta_patterns (...);
+CREATE TABLE IF NOT EXISTS services (
+    id TEXT PRIMARY KEY,
+    host_id TEXT NOT NULL REFERENCES hosts(id),
+    port INTEGER NOT NULL,
+    protocol TEXT DEFAULT 'tcp',
+    service_name TEXT,
+    version TEXT,
+    discovered_at TEXT NOT NULL,
+    discovery_node_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS credentials (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    credential_type TEXT DEFAULT 'password',
+    credential_value TEXT DEFAULT '',
+    domain TEXT,
+    valid_for TEXT DEFAULT '[]',
+    discovered_at TEXT NOT NULL,
+    discovery_node_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    host_id TEXT NOT NULL REFERENCES hosts(id),
+    session_type TEXT DEFAULT 'shell',
+    privilege_level TEXT DEFAULT 'user',
+    credential_id TEXT,
+    active INTEGER DEFAULT 1,
+    established_at TEXT NOT NULL,
+    node_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS vulnerabilities (
+    id TEXT PRIMARY KEY,
+    host_id TEXT NOT NULL REFERENCES hosts(id),
+    service_id TEXT,
+    cve_id TEXT,
+    description TEXT DEFAULT '',
+    exploitation_status TEXT DEFAULT 'discovered',
+    discovered_at TEXT NOT NULL,
+    discovery_node_id TEXT
+);
 ```
+
+**RAGスキーマはスプリント9で設計・作成する（PostgreSQL + pgvector）。** Nirvanaの既存スキーマをそのまま移植するため、スプリント2の時点でRAGスキーマを先行設計する必要はない。
 
 **Orchestratorとの接続**:
 
 ```python
-# orchestrator.py __init__() に追加（2行）
-db_url = config.get("db_url", ":memory:")
-self._state_store = StateStore(db_url=db_url)
+# orchestrator.py __init__() に追加
+session_db_path = os.path.join(self.session_dir, "state_store.db") if self.session_dir else ":memory:"
+self._state_store = StateStore(db_path=session_db_path)
 
-# orchestrator.py _observe_phase() に追加（nmap結果のパース例）
-if tool_name == "run_nmap" and not content.startswith("Error"):
-    # nmap出力からホスト/サービスを抽出してStateStoreに登録
-    parsed = self._parse_nmap_output(content)
-    for host_info in parsed.get("hosts", []):
-        host_id = self._state_store.add_host(HostEntity(
-            ip_address=host_info["ip"],
-            hostname=host_info.get("hostname"),
-        ))
-        for svc in host_info.get("services", []):
-            self._state_store.add_service(ServiceEntity(
+# orchestrator.py _observe_phase() に追加
+# 既存の _extract_findings_from_tool_output() の結果を利用してStateStoreに登録
+# 段階的に対応: スプリント2ではnmapとnucleiのみ、他はスプリント6以降で追加
+self._register_to_state_store(tool_name, tc.get("input", {}), content, findings)
+```
+
+**ツール結果のStateStore登録は段階的に対応する**:
+
+| スプリント | 対応ツール | 登録エンティティ |
+|---|---|---|
+| スプリント2 | run_nmap | Host + Service（ポート行の正規表現パース） |
+| スプリント2 | run_nuclei | Vulnerability（CVE行のパース） |
+| スプリント6 | run_whatweb | Service.version の更新 |
+| スプリント6 | run_sqlmap, run_wpscan | Vulnerability |
+| スプリント7 | run_hydra, forge_tool | Credential, Session |
+
+スプリント2ではnmapとnucleiのみに対応する。これらは既存の `_extract_findings_from_tool_output()` が既にパースしている情報を、StateStoreのエンティティとして二次的に登録する形で実装する。新しいパーサーは書かない。
+
+```python
+# orchestrator.py に追加するメソッド
+def _register_to_state_store(self, tool_name, tool_input, content, findings):
+    if not self._state_store:
+        return
+    target = tool_input.get("target", tool_input.get("url", ""))
+
+    # nmap: ポート行からHost + Serviceを登録
+    if tool_name in ("run_nmap",) and not content.startswith("Error"):
+        host = self._state_store.get_host_by_ip(target)
+        if not host:
+            host_id = self._state_store.add_host(HostEntity(ip_address=target))
+        else:
+            host_id = host.id
+        for line in content.splitlines():
+            match = re.match(r"(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)", line.strip())
+            if match:
+                self._state_store.add_service(ServiceEntity(
+                    host_id=host_id,
+                    port=int(match.group(1)),
+                    protocol=match.group(2),
+                    service_name=match.group(4),
+                    version=match.group(5).strip() or None,
+                ))
+
+    # nuclei: FindingからVulnerabilityを登録
+    for finding in findings:
+        if finding.cve_id:
+            host = self._state_store.get_host_by_ip(target)
+            host_id = host.id if host else self._state_store.add_host(
+                HostEntity(ip_address=target)
+            )
+            self._state_store.add_vulnerability(VulnerabilityEntity(
                 host_id=host_id,
-                port=svc["port"],
-                service_name=svc["service"],
-                version=svc.get("version"),
+                cve_id=finding.cve_id,
+                description=finding.title,
+                exploitation_status="discovered",
             ))
+```
 
-# orchestrator.py _format_state_summary() を改修
-# StateStoreから詳細情報を含む要約を生成
-hosts = self._state_store.get_hosts()
-for host in hosts:
-    services = self._state_store.get_services_for_host(host.id)
-    vulns = self._state_store.get_vulnerabilities_for_host(host.id)
-    svc_str = ", ".join(f"{s.port}/{s.service_name}" for s in services)
-    lines.append(f"  {host.ip_address} ({host.hostname}): {svc_str}")
-    for v in vulns:
-        lines.append(f"    [{v.exploitation_status}] {v.cve_id}: {v.description[:60]}")
+**`_format_state_summary()` の改修**:
+
+既存の `_format_state_summary()` を拡張し、StateStoreのデータがある場合はそちらから詳細な要約を生成する。StateStoreが空またはNoneの場合は既存のロジック（`self._findings[-5:]`のタイトル表示）にフォールバックする。既存の `MissionMemory.summary_for_context()` は削除せず、StateStoreの要約を**追加で**挿入する形とする。
+
+```python
+# _format_state_summary() に追加
+if self._state_store:
+    hosts = self._state_store.get_hosts()
+    if hosts:
+        lines.append("## StateStore")
+        for host in hosts:
+            services = self._state_store.get_services_for_host(host.id)
+            vulns = self._state_store.get_vulnerabilities_for_host(host.id)
+            svc_str = ", ".join(f"{s.port}/{s.service_name}" for s in services)
+            lines.append(f"  {host.ip_address} ({host.hostname or '?'}): {svc_str}")
+            for v in vulns:
+                lines.append(f"    [{v.exploitation_status}] {v.cve_id}: {v.description[:60]}")
 ```
 
 **検証手順**:
