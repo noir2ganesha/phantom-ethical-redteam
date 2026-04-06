@@ -59,6 +59,93 @@ except Exception as exc:
     _state_store = None
 
 # ---------------------------------------------------------------------------
+# EGATS Planner (Sprint 7) — attack tree management in MCP bridge
+# ---------------------------------------------------------------------------
+try:
+    from planner.egats import EGATSPlanner
+    from planner.models import ActionOutcome, AttackTree, AttackNode
+
+    _egats_planner = EGATSPlanner()
+    _egats_tree: AttackTree | None = None  # initialized on first tool call with a target
+    _egats_current_node: AttackNode | None = None
+    logger.info("EGATSPlanner loaded")
+except Exception as exc:
+    logger.warning("EGATSPlanner not available: %s", exc)
+    _egats_planner = None
+    _egats_tree = None
+    _egats_current_node = None
+    ActionOutcome = None
+
+# ErrorType → ActionOutcome mapping
+_ERROR_TO_OUTCOME: dict = {}
+if ErrorType and ActionOutcome:
+    _ERROR_TO_OUTCOME = {
+        ErrorType.TIMEOUT: ActionOutcome.PARTIAL,
+        ErrorType.AUTHENTICATION_FAILED: ActionOutcome.FAILURE,
+        ErrorType.WAF_BLOCKED: ActionOutcome.FAILURE,
+        ErrorType.CONNECTION_REFUSED: ActionOutcome.FAILURE,
+        ErrorType.TOOL_NOT_FOUND: ActionOutcome.FAILURE,
+        ErrorType.PERMISSION_DENIED: ActionOutcome.FAILURE,
+        ErrorType.DNS_RESOLUTION_FAILED: ActionOutcome.FAILURE,
+        ErrorType.SSL_CERTIFICATE_ERROR: ActionOutcome.PARTIAL,
+        ErrorType.RATE_LIMITED: ActionOutcome.PARTIAL,
+        ErrorType.SERVICE_UNAVAILABLE: ActionOutcome.PARTIAL,
+        ErrorType.AD_KERBEROS_ERROR: ActionOutcome.FAILURE,
+        ErrorType.AMSI_DETECTED: ActionOutcome.FAILURE,
+    }
+
+
+def _ensure_egats_tree(target: str) -> None:
+    """Initialize EGATS tree on first tool call with a target."""
+    global _egats_tree, _egats_current_node
+    if not _egats_planner:
+        return
+    if _egats_tree is None:
+        _egats_tree = _egats_planner.init_tree(target)
+        _egats_current_node = _egats_planner.select_next_node(_egats_tree)
+        logger.info("EGATS tree initialized for target: %s", target)
+
+
+def _egats_backpropagate(tool_name: str, result: str, error_type=None) -> None:
+    """Backpropagate tool execution outcome to EGATS tree."""
+    global _egats_current_node
+    if not _egats_planner or not _egats_tree or not _egats_current_node:
+        return
+
+    # Determine outcome
+    if error_type and error_type in _ERROR_TO_OUTCOME:
+        outcome = _ERROR_TO_OUTCOME[error_type]
+    elif result.startswith("Error") or result.startswith("SCOPE VIOLATION"):
+        outcome = ActionOutcome.FAILURE
+    else:
+        outcome = ActionOutcome.SUCCESS
+
+    # Backpropagate
+    _egats_planner.backpropagate(_egats_tree, _egats_current_node, outcome)
+    _egats_tree.total_actions += 1
+
+    # Compute TDI and check pruning
+    tdi = _egats_planner.compute_tdi(_egats_current_node, _egats_tree, 0.0)
+    _egats_current_node.tdi = tdi
+    pruned = _egats_planner.check_pruning(_egats_tree)
+    if pruned:
+        logger.info("EGATS pruned %d nodes: %s", len(pruned), pruned)
+
+    # Select next node for future tool calls
+    _egats_current_node = _egats_planner.select_next_node(_egats_tree)
+    if _egats_current_node:
+        mode = _egats_planner.select_mode(tdi)
+        logger.info(
+            "EGATS: %s → %s (promise=%.3f, TDI=%.3f, mode=%s)",
+            tool_name,
+            outcome.name,
+            _egats_current_node.promise_score,
+            tdi.value,
+            mode,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Post-tool processing: ErrorHandler + StateStore (3-layer extraction)
 # ---------------------------------------------------------------------------
 
@@ -220,18 +307,27 @@ def _post_tool_processing(tool_name: str, tool_input: dict, result: str) -> None
     """
 
     # --- ErrorHandler ---
+    _detected_error_type = None
     if _error_handler and result:
         _lower = result.lower()[:200]
         if any(kw in _lower for kw in _ERROR_KEYWORDS):
-            error_type = _error_handler.classify(result, tool_name)
-            if error_type != ErrorType.UNKNOWN:
-                recovery = _error_handler.recover(error_type, {"tool": tool_name})
+            _detected_error_type = _error_handler.classify(result, tool_name)
+            if _detected_error_type != ErrorType.UNKNOWN:
+                recovery = _error_handler.recover(_detected_error_type, {"tool": tool_name})
                 logger.info(
                     "ErrorHandler: %s -> %s: %s",
-                    error_type.value,
+                    _detected_error_type.value,
                     recovery.action.value,
                     recovery.suggestion,
                 )
+            else:
+                _detected_error_type = None  # UNKNOWN means no real error
+
+    # --- EGATS backpropagation (Sprint 7) ---
+    target = tool_input.get("target", tool_input.get("url", ""))
+    if target:
+        _ensure_egats_tree(target)
+    _egats_backpropagate(tool_name, result, _detected_error_type)
 
     # --- StateStore (3-layer extraction) ---
     if not _state_store:
@@ -364,6 +460,23 @@ def generate_hypotheses() -> str:
         lines.append(f"  {i}. [{h.confidence:.2f}] {h.description}")
         if h.verification_method:
             lines.append(f"     verify: {h.verification_method[:80]}")
+
+    # Append EGATS attack tree status (Sprint 7)
+    if _egats_tree and _egats_planner:
+        lines.append("")
+        lines.append("EGATS attack tree status:")
+        total = len(_egats_tree.nodes)
+        from planner.models import NodeStatus
+        active = sum(1 for n in _egats_tree.nodes.values() if n.status not in (NodeStatus.PRUNED, NodeStatus.FAILED))
+        pruned = sum(1 for n in _egats_tree.nodes.values() if n.status == NodeStatus.PRUNED)
+        lines.append(f"  Nodes: {total} total, {active} active, {pruned} pruned")
+        lines.append(f"  Actions: {_egats_tree.total_actions}")
+        if _egats_current_node:
+            tdi = _egats_planner.compute_tdi(_egats_current_node, _egats_tree, 0.0)
+            mode = _egats_planner.select_mode(tdi)
+            lines.append(f"  Current: {_egats_current_node.description[:60]}")
+            lines.append(f"  TDI: {tdi.value:.3f}, Mode: {mode}")
+
     return "\n".join(lines)
 
 
