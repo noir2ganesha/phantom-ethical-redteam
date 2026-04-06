@@ -40,7 +40,7 @@ class StateStore:
             db_path: Path to SQLite database file, or ``:memory:``.
         """
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._create_tables()
