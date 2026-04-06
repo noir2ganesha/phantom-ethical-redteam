@@ -1317,19 +1317,19 @@ if self._state_store:
 
 ---
 
-#### スプリント3: ADツール追加（完全独立、TOOL_REGISTRYへの追加のみ）
+#### スプリント3: ADツール追加 → **延期（ADターゲット遭遇時に実施）**
 
-**目的**: Active Directory / Windows環境への対応力を拡張する。
+**延期理由**: 設計レビューにより以下の問題が判明したため、ADターゲットに遭遇した時点で実施に変更。
 
-**移植元**: Excalibur `excalibur/tools/categories/active_directory.py`（944行）
+1. **移植元の不一致**: Excaliburのactive_directory.py（944行）はExcalibur独自のツール定義フレームワーク（`TypedSecurityTool`, `TypedToolInterface`, `ToolParameter`等のPydanticモデル）で書かれており、`run()` 関数や `subprocess.run()` 呼出を含まない。Phantomのツールパターン（`TOOL_SPEC` dict + `run()` 関数 + `subprocess.run()` + `scope_guard`）とは全く異なるアーキテクチャであるため、そのまま移植できない。Excaliburのスキーマを参考にPhantomパターンで1から書く必要がある（8ツール × 80〜120行 = 640〜960行の新規コード）。
 
-**新規ファイル**: `agent/tools/active_directory.py`
+2. **実データ検証ができない**: 現在のKali環境にADドメインがなく、bloodhound-python、ldapdomaindump等のsubprocess出力を検証できない。スプリント1・2で確立した「実データで挙動をトレースして確認」の品質基準を満たせない。
 
-**改修ファイル**: `agent/tools/__init__.py`（`_optional`リストに`"active_directory"`を追加、1行）
+3. **後から追加するリスクが極低**: ADツールはTOOL_REGISTRYの`_optional`リストに追加するだけの完全独立モジュール。いつ追加しても他コンポーネントへの影響はゼロ。MCPブリッジもTOOL_REGISTRYを自動検出するため変更不要。
 
-**他コンポーネントへの依存**: なし（subprocess呼出、既存ツールと同一パターン）
+**実施条件**: HTBまたは実環境でWindowsマシン/ADドメインがターゲットになった時点で、実際のAD出力に基づいて正確なパーサーを含む`run()`関数を実装する。
 
-**追加されるツール（8ツール）**:
+**追加予定ツール（8ツール、実施時の参考）**:
 
 | ツール | 機能 | 外部バイナリ |
 |---|---|---|
@@ -1342,16 +1342,9 @@ if self._state_store:
 | pingcastle | ADリスクスコアリング | pingcastle |
 | adrecon | AD包括監査 | adrecon |
 
-**検証手順**:
-
-1. ユニットテスト: 各ツールのTOOL_SPECが正しいJSON Schema形式であることを確認
-2. 統合テスト: `from tools import TOOL_REGISTRY` で8ツールが登録されることを確認（既存27 + 8 = 35ツール）
-3. MCP検証: `mcp_bridge.py` で35ツール全てがFastMCPに登録されることを確認
-4. 回帰テスト: 既存363テスト全パス
-
 ---
 
-#### スプリント4: EGATS コア（完全独立、Orchestratorへの接続なし）
+#### スプリント3（旧4）: EGATS コア（完全独立、Orchestratorへの接続なし）
 
 **目的**: UCB+TDA+バックプロパゲーション+枝刈りの攻撃計画エンジンを追加する。このスプリントではOrchestratorとの接続は行わず、コンポーネント単体の動作を確認する。
 
@@ -1708,13 +1701,13 @@ class MemoryDistiller:
 ### 7.4 スプリントサマリと依存関係図
 
 ```
-スプリント1: ErrorHandler ←── 依存なし（完全独立）
+スプリント1: ErrorHandler ←── 依存なし ✅ 完了
     │
-スプリント2: DB層 + StateStore ←── 依存なし（完全独立）
+スプリント2: DB層 + StateStore ←── 依存なし ✅ 完了
     │
-スプリント3: ADツール ←── 依存なし（完全独立）
+スプリント3: ADツール ←── 延期（ADターゲット遭遇時に実施）
     │
-スプリント4: EGATS コア ←── 依存なし（完全独立）
+スプリント3(旧4): EGATS コア ←── 依存なし（完全独立）← 次に実施
     │
     ├── スプリント5: 事前バリデーション ←── StateStore (スプリント2)
     │
@@ -1731,7 +1724,7 @@ class MemoryDistiller:
                    └── スプリント11: 仮説第3層有効化 ←── RAG (スプリント9) + 4層仮説 (スプリント6)
 ```
 
-スプリント1〜4は互いに独立しており、**並行実施も可能**。スプリント5以降は依存関係に従って順次実施する。
+スプリント1〜2は完了済み。スプリント3（ADツール）は延期（ADターゲット遭遇時に実施）。スプリント3（旧4）のEGATSコアから再開。スプリント5以降は依存関係に従って順次実施する。
 
 各スプリント完了時のチェックリスト:
 - [ ] 新規コンポーネントのユニットテスト全パス
