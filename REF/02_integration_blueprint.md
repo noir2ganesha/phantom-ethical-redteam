@@ -445,6 +445,20 @@ orchestrator.py の _execute_tool() を改修:
       ESCALATE → LLMにエラー情報を渡して判断を委任
 ```
 
+**ErrorHandlerの段階的な機能拡張ロードマップ**:
+
+ErrorHandlerは段階的に機能を拡張する設計であり、一度に全てを実装しない。
+
+| スプリント | 実装内容 | 効果 |
+|---|---|---|
+| スプリント1 | エラー分類（13型）+ 回復提案（7種）をログに記録するのみ。自動リトライは行わない。Orchestratorの`_execute_tool()`に分類・ログを追加 | エラーの見える化。Claudeへのtool_resultにはエラー文字列がそのまま返り、Claudeの次ターン判断に委ねる。人間やClaudeが回復提案をログから参照できる |
+| スプリント2 | ErrorHandlerの分類結果をStateStoreに記録。エラー履歴の蓄積が可能に | 「同じツールが同じターゲットで3回連続TIMEOUT」等のパターンを検出可能 |
+| スプリント5 | 事前バリデーション（PreValidator）がStateStoreのエラー履歴を参照。過去に失敗したツール+パラメータの組合せを事前に警告 | 同じ失敗の繰り返しを予防 |
+| スプリント7 | EGATS統合後、ErrorHandlerの分類結果をバックプロパゲーションに連携。`AUTHENTICATION_FAILED`→ノードのpromise_score低下→TDI上昇→自動枝刈り→別ノードにピボット。`RETRY_WITH_DELAY`→同ノードで待機後リトライ。`SWITCH_TOOL`→同ノード内で代替ツールを選択 | **自動的な攻撃方針転換**。kobold.htbのF3（Arcane認証13分行き詰まり）はErrorHandler+EGATSの連携で自動ピボットされる |
+| スプリント9以降 | RAG StrategyMemoryと連携。ErrorHandlerが`get_failure_recovery()`で過去の回復パターンを検索し、パターンベースより精度の高い回復提案を返す | 過去のセッションで学んだ回復方法（例: TLS 1.2フォールバック）を自動適用 |
+
+**つまりErrorHandlerは単体でも有用（エラーの体系的分類と見える化）だが、EGATS（スプリント7）およびRAG（スプリント9以降）と組み合わさることで真価を発揮する。**
+
 
 ### 4.3 LLMRouter（難易度適応モデル選択）
 
@@ -1023,7 +1037,7 @@ EGATS Forest       → StateStore（ホスト/サービス情報の参照）
 
 #### スプリント1: ErrorHandler（完全独立、既存コードへの影響ゼロ）
 
-**目的**: ツール実行エラーを体系的に分類し、自動回復アクションを実行する。kobold.htbのF2（TLS 1.3タイムアウト）、F3（認証失敗ループ）を解決する。
+**目的**: ツール実行エラーを体系的に分類し、回復アクションを提案する。このスプリントでは**分類とログ記録のみ**を実装し、自動リトライは行わない（自動リトライはスプリント7でEGATS連携時に実装）。kobold.htbのF2（TLS 1.3タイムアウト）、F3（認証失敗ループ）のエラー分類基盤を構築する。
 
 **移植元**: Nirvana `nirvana/execution/error_handler.py`（205行）
 
@@ -1337,7 +1351,23 @@ class PreValidator:
 
 **改修ファイル**: `agent/orchestrator.py`（`run_mission`, `_plan_phase`, `_observe_phase`, `_reflect_phase` の4メソッドを改修）
 
-**依存**: StateStore（スプリント2）+ EGATS コア（スプリント4）
+**依存**: StateStore（スプリント2）+ EGATS コア（スプリント4）+ ErrorHandler（スプリント1）
+
+**ErrorHandlerとの連携（このスプリントで実装）**: スプリント1ではErrorHandlerは分類・ログのみだったが、このスプリントでEGATSのバックプロパゲーションと連携させる。ErrorHandlerが分類したエラー種別に応じて、攻撃ツリーノードのoutcomeを決定する。
+
+```
+ErrorType.AUTHENTICATION_FAILED → ActionOutcome.FAILURE → promise_score低下 → TDI上昇 → 枝刈り → 自動ピボット
+ErrorType.WAF_BLOCKED → ActionOutcome.FAILURE + set_stealth_profile("stealthy") → 同ノードで再試行
+ErrorType.TIMEOUT → ActionOutcome.PARTIAL → 待機後リトライ（同ノード）
+ErrorType.TOOL_NOT_FOUND → ActionOutcome.FAILURE → 代替ツールノードを生成
+ErrorType.CONNECTION_REFUSED → ActionOutcome.FAILURE → ポート/サービスの再確認ノードを生成
+```
+
+これにより、kobold.htbのF3（Arcane認証13分行き詰まり）は以下のフローで自動解決される：
+1. デフォルトクレデンシャル試行 → `AUTHENTICATION_FAILED` → promise_score低下
+2. CVE-2026-23944試行 → 失敗 → さらにpromise_score低下
+3. TDI > 0.8 → 枝刈り → UCBが未訪問ノード（サブドメイン列挙）を自動選択
+4. mcp.kobold.htb発見 → MCPJam仮説 → RCE
 
 **Orchestrator改修の詳細**:
 
