@@ -1399,17 +1399,19 @@ if self._state_store:
 
 ---
 
-#### スプリント5: 事前バリデーション（scope_guard拡張 + StateStore参照）
+#### スプリント4(旧5): 事前バリデーション + Sprint 1〜3 Orchestrator統合テスト
 
-**目的**: ツール実行前にパラメータの妥当性とStateStoreとの整合性を検証する。Co-RedTeamのValidation Agent概念をプログラム的に実装する。
+**目的1: 事前バリデーション実装**: ツール実行前にパラメータの妥当性とStateStoreとの整合性を検証する。Co-RedTeamのValidation Agent概念をプログラム的に実装する。
 
-**新規ファイル**: `agent/execution/pre_validator.py`（~80行）
+**目的2: Sprint 1〜3 の Orchestrator 統合テスト**: Sprint 1（ErrorHandler）と Sprint 2（StateStore `_register_to_state_store`）は Orchestrator に接続済みだが、Orchestrator 経由での動作確認が未実施。このスプリントで2段階の統合テストを行う：(1) `_execute_tool()` と `_observe_phase()` を個別に呼出してデータフローを確認、(2) 実際のLLM（OAuth認証/Max 20x、コスト発生なし）でOrchestratorの `run_mission()` を短縮実行（max_turns=3〜5）して全コンポーネントの接続を確認する。
+
+**新規ファイル**: `agent/execution/pre_validator.py`（~80行）, `tests/test_orchestrator_integration.py`
 
 **改修ファイル**: `agent/orchestrator.py`（`_execute_tool()`に5行追加）
 
-**依存**: StateStore（スプリント2）
+**依存**: StateStore（スプリント2）, ErrorHandler（スプリント1）
 
-**検証内容**:
+**事前バリデーション設計**:
 
 ```python
 # agent/execution/pre_validator.py
@@ -1436,11 +1438,59 @@ class PreValidator:
         return True, ""
 ```
 
+**Orchestrator統合テスト設計（2段階）**:
+
+**段階1: メソッド個別呼出テスト** — Orchestratorをインスタンス化せず、`_execute_tool()` と `_observe_phase()` のロジックを再現して実データを流す。LLM不要。
+
+```python
+# tests/test_orchestrator_integration.py
+
+# テスト1: _execute_tool() → ErrorHandler 連携
+#   実際のrun_nmap実行結果（正常）を渡し、ErrorHandlerが発動しないことを確認
+#   エラー文字列（"Connection refused"等）を渡し、ErrorHandlerが正しく分類することを確認
+
+# テスト2: _observe_phase() → StateStore._register_to_state_store() 連携
+#   実際のnmap出力テキストを content として渡し、
+#   tool_name="run_nmap", tool_input={"target": "10.129.16.19"} と組み合わせて
+#   _register_to_state_store() を呼出し、StateStoreに正しくHost+Serviceが登録されることを確認
+
+# テスト3: _observe_phase() → StateStore + nuclei CVE連携
+#   nuclei出力（CVE行あり）を content として渡し、
+#   _extract_findings() で Finding.cve_id が抽出され、
+#   _register_to_state_store() で Vulnerability が StateStore に登録されることを確認
+
+# テスト4: _format_state_summary() → StateStore 要約
+#   StateStoreにデータを登録した状態で _format_state_summary() を呼出し、
+#   出力に "## StateStore" セクションが含まれ、ホスト/サービス/脆弱性の詳細が
+#   正しく表示されることを確認
+
+# テスト5: ErrorHandler → StateStore 連携（エラー時でもStateStore登録が壊れないこと）
+#   エラー文字列を含むtool_resultを渡し、ErrorHandlerが分類した後でも
+#   _register_to_state_store() が安全にスキップされる（Error開始文字列はパースしない）
+#   ことを確認
+```
+
+**段階2: run_mission() 短縮実行テスト** — OAuth認証（Max 20x、コスト発生なし）で実際のLLMを呼び出し、Orchestratorの `run_mission()` を `max_turns=3〜5` で実行する。全コンポーネント（ErrorHandler、StateStore、PreValidator）がPAORループ内で正しく連携することを確認する。
+
+```
+実行方法:
+  python agent/main.py --v3
+  config.yaml: provider=anthropic, auth_method=oauth, max_autonomous_turns=5
+  scopes/current_scope.md: 実際のHTBターゲット（10.129.16.19等）
+
+確認項目:
+  - ツール実行後にStateStoreにエンティティが登録されているか（state_store.db確認）
+  - エラー発生時にErrorHandlerのログが出力されているか（agent.log確認）
+  - _format_state_summary()に "## StateStore" セクションが含まれているか
+  - PreValidatorがスコープ外ターゲットを拒否しているか
+```
+
 **検証手順**:
 
-1. ユニットテスト: 不正パラメータ（スコープ外target、不正なport値等）が拒否されることを確認
-2. 統合テスト: Orchestratorの`_execute_tool()`が事前バリデーション失敗時にツール実行をスキップすることを確認
-3. 回帰テスト: 既存363テスト全パス
+1. ユニットテスト: PreValidator単体で不正パラメータが拒否されることを確認
+2. **Orchestrator統合テスト（上記5テスト）**: _execute_tool/observe_phase/format_state_summaryの実データフロー検証
+3. 統合テスト: Orchestratorの`_execute_tool()`が事前バリデーション失敗時にツール実行をスキップすることを確認
+4. 回帰テスト: 既存462テスト全パス（Sprint1: 39 + Sprint2: 25 + Sprint3: 35 + 既存363）
 
 ---
 
@@ -1473,9 +1523,9 @@ class PreValidator:
    assert len(mcpjam_hyps) > 0  # MCPJam仮説が自動生成されること
    ```
 
-2. 実データ検証: kobold.htbのStateStoreデータ（4ポート、2サブドメイン）を入力し、MCPJam RCE仮説がconfidence 0.75で生成されることを確認
+2. 実データ検証: kobold.htbのStateStoreデータ（4ポート、2サブドメイン）を入力し、MCPJam RCE仮説がconfidence 0.75で生成されることを確認。devarea.htbデータ（6ポート、Hoverfly/Jetty）でも仮説生成が妥当であることを確認
 
-3. 回帰テスト: 既存363テスト全パス + 既存のburst_launch()も引き続き動作すること
+3. 回帰テスト: 既存462+テスト全パス + 既存のburst_launch()も引き続き動作すること
 
 ---
 
@@ -1551,15 +1601,32 @@ def _reflect_phase(self):
 
 **検証手順**:
 
-1. 統合テスト: Orchestratorのrun_mission()が正常に起動し、PAORループ内でEGATSノード選択が行われることを確認
+1. **Orchestrator統合テスト（PAORループ全体）**: Orchestratorのrun_mission()を実際のLLMプロバイダ（ローカルOllama/llama.cpp推奨、Claudeはコスト発生）で起動し、以下を確認：
+   - __init__でEGATSPlanner, AttackForest, StateStore, ErrorHandlerが全て正常初期化
+   - _plan_phase()内でForestUCB→UCB→TDI→mode選択が実行される
+   - _act_phase()でtool_useがTOOL_REGISTRYから実行される
+   - _execute_tool()でErrorHandlerが正しく発動/非発動する
+   - _observe_phase()でStateStore登録→EGATS expand_tree→backpropagateが実行される
+   - _reflect_phase()でpruning結果がReflectorに渡される
+   - _format_state_summary()にStateStoreデータが含まれる
 
-2. 実データ検証: kobold.htbシナリオをシミュレート
+2. **ErrorHandler→EGATS連携テスト**: 以下のフローを実データで確認：
+   - ツール実行 → ErrorHandler.classify() → ErrorType取得
+   - ErrorType → ActionOutcome変換（AUTHENTICATION_FAILED→FAILURE、TIMEOUT→PARTIAL等）
+   - backpropagate(tree, node, outcome) → promise_score変動
+   - should_prune() → 枝刈り判定
+
+3. 実データ検証: kobold.htbシナリオをシミュレート
    - ターン1-3: nmap→StateStore登録→ノードexpand
    - ターン4-8: Arcane認証試行→失敗→TDI上昇→promise低下
    - ターン9: 枝刈り発生→UCBが未訪問ノード（サブドメイン列挙）を選択
    - ターン10: mcp.kobold.htb発見→MCPJam仮説→RCE
 
-3. 回帰テスト: 既存363テスト全パス + EGATS無効時（`_forest = None`）に既存動作が維持されること
+4. devarea.htbデータ（6ポート、Hoverfly/Jetty/FTP）でも同様のフローを検証
+
+5. 回帰テスト: 既存462+テスト全パス + EGATS無効時（`_forest = None`）に既存動作が維持されること
+
+6. **MCPブリッジ検証**: mcp_bridge.pyで全ツール（27+AD追加分）がFastMCPに登録されることを確認
 
 ---
 
