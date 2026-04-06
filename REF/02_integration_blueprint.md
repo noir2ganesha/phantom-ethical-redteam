@@ -1089,7 +1089,7 @@ if self._error_handler and result and "error" in str(result).lower():
 
 **移植元**: Excalibur `excalibur/memory/state_store.py`（688行）+ `excalibur/memory/models.py`（76行）
 
-**新規ファイル**: `agent/memory/db.py`（DB接続抽象化）, `agent/memory/state_store.py`, `agent/memory/entity_models.py`
+**新規ファイル**: `agent/memory/state_store.py`, `agent/memory/entity_models.py`（db.pyは廃止 — 問題2で解決済み）
 
 **改修ファイル**: `agent/orchestrator.py`（`__init__`, `_observe_phase`, `_format_state_summary` に計20〜30行追加）
 
@@ -1109,6 +1109,9 @@ SQLiteとPostgreSQLはSQL方言が異なり（`?` vs `%s`、`SERIAL` vs `INTEGER
 **StateStoreスキーマ（スプリント2で作成、SQLite）**:
 
 ```sql
+-- SQLiteではFOREIGN KEYがデフォルトOFFのため、接続時に明示的に有効化する
+PRAGMA foreign_keys = ON;
+
 CREATE TABLE IF NOT EXISTS hosts (
     id TEXT PRIMARY KEY,
     ip_address TEXT NOT NULL,
@@ -1599,7 +1602,7 @@ def _reflect_phase(self):
 
 **改修ファイル**: なし（このスプリントではOrchestratorに接続しない。スプリント10で接続）
 
-**依存**: DB層（スプリント2で設計済みのPostgreSQLスキーマ）
+**依存**: なし（RAGはPostgreSQLに独自接続。StateStoreのSQLiteとは独立）
 
 **前提条件**: PostgreSQL + pgvector拡張がインストールされていること。sentence-transformersがpip installされていること。
 
@@ -1721,7 +1724,7 @@ class MemoryDistiller:
          │
          └── スプリント8: LLMRouter ←── EGATS統合 (スプリント7) でTDI利用可能
               │
-              └── スプリント9: RAG基盤 ←── DB層 (スプリント2)
+              └── スプリント9: RAG基盤 ←── 依存なし（PostgreSQL独自接続）
                    │
                    ├── スプリント10: メモリ蒸留 + debrief ←── RAG (スプリント9)
                    │
