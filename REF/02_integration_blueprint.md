@@ -1348,13 +1348,19 @@ if self._state_store:
 
 **目的**: UCB+TDA+バックプロパゲーション+枝刈りの攻撃計画エンジンを追加する。このスプリントではOrchestratorとの接続は行わず、コンポーネント単体の動作を確認する。
 
-**移植元**: Nirvana `nirvana/planner/`（egats.py, ucb.py, tda.py, backpropagation.py, pruning.py, pivot.py, models.py, mode_selector.py — Forest以外）
+**移植元**: Nirvana `nirvana/planner/`（8ファイル、Forest/ExploitPlan除外）
 
 **新規ファイル**: `agent/planner/__init__.py`, `agent/planner/egats.py`, `agent/planner/ucb.py`, `agent/planner/tda.py`, `agent/planner/backpropagation.py`, `agent/planner/pruning.py`, `agent/planner/pivot.py`, `agent/planner/models.py`, `agent/planner/mode_selector.py`
 
+**除外ファイルと理由**:
+- `forest.py`（293行）→ スプリント7で追加。StateStoreへの依存があり（`from nirvana.memory.state_store import StateStore`）、このスプリントの「完全独立」原則に反する
+- `exploit_plan.py`（490行）→ スプリント7で追加。EGATSPlanner自体はExploitPlanを参照しておらず（ソースコード確認済み）、Orchestratorのexploitフェーズ統合時に必要
+
 **改修ファイル**: なし（このスプリントではOrchestratorに接続しない）
 
-**他コンポーネントへの依存**: なし（planner/内部モジュール間の依存のみ）
+**他コンポーネントへの依存**: なし（planner/内部モジュール間の依存のみ。models.pyがPydantic BaseModelを使用するが、.venvにpydantic v2.12.5がインストール済み）
+
+**移植時の変更点**: 全ファイルで `from nirvana.planner.xxx` を `from planner.xxx` に変更するのみ。ロジックの変更は不要
 
 **検証手順**:
 
@@ -1383,9 +1389,13 @@ if self._state_store:
    assert "10.129.245.51" in tree.compromised_hosts
    ```
 
-2. 実データ検証: kobold.htbのシナリオ（4ポート発見→Arcane調査→行き詰まり→ピボット）をシミュレートし、TDIが上昇して枝刈りが発生することを確認
+2. 実データ検証: kobold.htbのシナリオ（4ポート発見→Arcane調査→行き詰まり→ピボット）をシミュレートし、TDIが上昇して枝刈りが発生することを確認。具体的には：
+   - ルートノード作成 → UCB選択 → TDI計算（初回は0.4前後のはず）
+   - 認証失敗を3回シミュレート → backpropagate(FAILURE)×3 → TDI上昇
+   - TDI > prune_threshold(0.8) で枝刈りされることを確認
+   - 新ホスト発見 → spawn_pivot → compromised_hostsに追加されることを確認
 
-3. 回帰テスト: 既存363テスト全パス（Orchestratorに接続していないため影響なし）
+3. 回帰テスト: 既存427テスト全パス（Sprint1: 39 + Sprint2: 25 + 既存363。Orchestratorに接続していないため影響なし）
 
 ---
 
