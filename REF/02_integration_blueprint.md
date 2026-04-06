@@ -182,7 +182,7 @@ Nirvana/Excaliburではコンテキストに具体的なコマンド（`bash -i 
 | 機能 | Phantom | Excalibur | **Nirvana（勝者）** | HEXSTRIKE |
 |---|---|---|---|---|
 | エラー分類 | なし（ツール内処理） | なし | **13型** | 類似 |
-| 回復アクション | なし | なし | **7種** | 適応戦略 |
+| 回復アクション | なし | なし | **6種** | 適応戦略 |
 | AD固有エラー | なし | なし | **KDC_ERR, AMSI** | なし |
 | WAF検出 | なし | なし | **WAF→ステルス切替** | なし |
 
@@ -451,7 +451,7 @@ ErrorHandlerは段階的に機能を拡張する設計であり、一度に全�
 
 | スプリント | 実装内容 | 効果 |
 |---|---|---|
-| スプリント1 | エラー分類（13型）+ 回復提案（7種）をログに記録するのみ。自動リトライは行わない。Orchestratorの`_execute_tool()`に分類・ログを追加 | エラーの見える化。Claudeへのtool_resultにはエラー文字列がそのまま返り、Claudeの次ターン判断に委ねる。人間やClaudeが回復提案をログから参照できる |
+| スプリント1 | エラー分類（13型）+ 回復提案（6種）をログに記録するのみ。自動リトライは行わない。Orchestratorの`_execute_tool()`に分類・ログを追加 | エラーの見える化。Claudeへのtool_resultにはエラー文字列がそのまま返り、Claudeの次ターン判断に委ねる。人間やClaudeが回復提案をログから参照できる |
 | スプリント5 | 事前バリデーション（PreValidator）が直前のエラー分類結果を参照。同一ツール+同一ターゲットで直前に失敗したパターンを事前に警告 | 同じ失敗の繰り返しを予防 |
 | スプリント7 | EGATS統合後、ErrorHandlerの分類結果をバックプロパゲーションに連携。既存の `ActionRecord` に `error_type: str` フィールドを追加し、エラー種別を記録。`AUTHENTICATION_FAILED`→ノードのpromise_score低下→TDI上昇→自動枝刈り→別ノードにピボット。`RETRY_WITH_DELAY`→同ノードで待機後リトライ。`SWITCH_TOOL`→同ノード内で代替ツールを選択 | **自動的な攻撃方針転換**。kobold.htbのF3（Arcane認証13分行き詰まり）はErrorHandler+EGATSの連携で自動ピボットされる |
 | スプリント9以降 | RAG StrategyMemoryと連携。ErrorHandlerが`get_failure_recovery()`で過去の回復パターンを検索し、パターンベースより精度の高い回復提案を返す | 過去のセッションで学んだ回復方法（例: TLS 1.2フォールバック）を自動適用 |
@@ -919,7 +919,7 @@ Phantom v4 (統合版)
 │   └── types.py                         既存（AttackState等）
 │
 ├── execution/                         [NEW]
-│   └── error_handler.py                 ErrorHandler: 13型×7回復
+│   └── error_handler.py                 ErrorHandler: 13型×6回復
 │
 ├── providers/
 │   ├── __init__.py                      既存（get_provider ファクトリ）
@@ -1735,7 +1735,7 @@ class PreValidator:
 
 #### スプリント6: 4層仮説生成エンジン（StateStore参照）
 
-**目的**: Phantomの既存HypothesisEngineを4層構造に拡張する。PRODUCT_CATALOG（18+製品）とSSRF_HOSTNAME_PATTERNS（9カテゴリ・70+パターン）を組み込む。kobold.htbのF1（サブドメイン発見失敗）、F4（MCPJam未発見）を解決する。
+**目的**: Phantomの既存HypothesisEngineを4層構造に拡張する。PRODUCT_CATALOG（18+製品）とSSRF_HOSTNAME_PATTERNS（10カテゴリ・67パターン）を組み込む。kobold.htbのF1（サブドメイン発見失敗）、F4（MCPJam未発見）を解決する。
 
 **移植元**: Nirvana `nirvana/reasoning/hypothesis_engine.py`（1,285行）
 
@@ -2091,7 +2091,7 @@ class MemoryDistiller:
 
 経路1 — **ワイルドカードSAN検出**: Nmap結果のTLS証明書情報（`SAN=*.kobold.htb`）をStateStore経由で検知し、「ワイルドカードSAN検出 → 20K+ワードリストでvhost列挙を推奨」仮説を自動生成する。
 
-経路2 — **SSRF_HOSTNAME_PATTERNS辞書**: これはNirvanaに組み込まれた汎用的なサブドメイン辞書であり、9カテゴリ・70+パターンを含む。MCPJamに限らず、監視系（zabbix, grafana, prometheus等）、CI/CD系（jenkins, gitlab等）、DB系（db, mysql, redis等）、認証系（keycloak, auth, sso等）など、ペンテストで頻出するサブドメインパターンが網羅されている。`mcp` カテゴリ（`["mcp", "mcpjam", "inspector", "model-context-protocol"]`）はその70+パターンの一部であり、kobold.htb専用の知識ではなく汎用的なドメイン知識である。
+経路2 — **SSRF_HOSTNAME_PATTERNS辞書**: これはNirvanaに組み込まれた汎用的なサブドメイン辞書であり、10カテゴリ・67パターンを含む。MCPJamに限らず、監視系（zabbix, grafana, prometheus等）、CI/CD系（jenkins, gitlab等）、DB系（db, mysql, redis等）、認証系（keycloak, auth, sso等）など、ペンテストで頻出するサブドメインパターンが網羅されている。`mcp` カテゴリ（`["mcp", "mcpjam", "inspector", "model-context-protocol"]`）はその67パターンの一部であり、kobold.htb専用の知識ではなく汎用的なドメイン知識である。
 
 経路3 — **プロダクトカタログの動的拡張**: `_load_external_product_catalog()` により外部カタログファイルからの動的追加が可能。新しい製品やパターンを発見したら追加すれば全ミッションに反映される。
 
@@ -2182,7 +2182,7 @@ F1が解決されれば、`mcp.kobold.htb` が発見される。その時点で4
 
 **7つの行き詰まりのうち6つが統合により自動解決される。**
 
-特に最も致命的だったF1（サブドメイン列挙の失敗）は、4層仮説生成のSSRF_HOSTNAME_PATTERNSが9カテゴリ・70+パターンの**汎用的なペンテストドメイン知識**として`mcp`を含んでおり、kobold.htb固有の知識に依存せずに解決できる。さらにRAG MetaPatternsにより「20K+ワードリストを使用すべき」という教訓が永続化され、同種の失敗が全ての将来のミッションで防止される。
+特に最も致命的だったF1（サブドメイン列挙の失敗）は、4層仮説生成のSSRF_HOSTNAME_PATTERNSが10カテゴリ・67パターンの**汎用的なペンテストドメイン知識**として`mcp`を含んでおり、kobold.htb固有の知識に依存せずに解決できる。さらにRAG MetaPatternsにより「20K+ワードリストを使用すべき」という教訓が永続化され、同種の失敗が全ての将来のミッションで防止される。
 
 
 ### 8.4 プロダクトカタログの汎用性について
@@ -2212,7 +2212,7 @@ F1が解決されれば、`mcp.kobold.htb` が発見される。その時点で4
 | wordpress | 80 | Plugin vulnerabilities (WPScan) |
 | + 外部 | — | `_load_external_product_catalog()` で動的拡張可能 |
 
-**SSRF_HOSTNAME_PATTERNS（9カテゴリ・70+パターン）**:
+**SSRF_HOSTNAME_PATTERNS（10カテゴリ・67パターン）**:
 
 | カテゴリ | パターン |
 |---|---|
