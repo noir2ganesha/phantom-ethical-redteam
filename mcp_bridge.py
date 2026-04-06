@@ -72,6 +72,30 @@ try:
 except Exception as exc:
     logger.warning("EGATSPlanner not available: %s", exc)
     _egats_planner = None
+
+# ---------------------------------------------------------------------------
+# RAG Memory (Sprint 9) — cross-session knowledge persistence
+# ---------------------------------------------------------------------------
+try:
+    from memory.rag.attack_memory import AttackMemory
+    from memory.rag.strategy_memory import StrategyMemory
+
+    _RAG_DB_URL = "postgresql://noir:noir2princess@localhost/phantom"
+    _attack_memory = AttackMemory(db_config=_RAG_DB_URL)
+    _strategy_memory = StrategyMemory(db_config=_RAG_DB_URL)
+    if _attack_memory.is_available:
+        logger.info("RAG AttackMemory loaded")
+    else:
+        logger.warning("RAG AttackMemory not available (PostgreSQL connection failed)")
+        _attack_memory = None
+    if _strategy_memory and _strategy_memory.is_available:
+        logger.info("RAG StrategyMemory loaded")
+    else:
+        _strategy_memory = None
+except Exception as exc:
+    logger.warning("RAG not available: %s", exc)
+    _attack_memory = None
+    _strategy_memory = None
     _egats_tree = None
     _egats_current_node = None
     ActionOutcome = None
@@ -456,6 +480,19 @@ def generate_hypotheses() -> str:
         return "No hypotheses generated. More reconnaissance data may be needed."
 
     lines = [f"Generated {len(hypotheses)} hypotheses:"]
+
+    # Sprint 11: RAG Layer 3 — append similar past attacks
+    if _attack_memory and _attack_memory.is_available:
+        try:
+            query = f"{context.get('target', '')} {' '.join(s.get('service', '') for s in services_list)}"
+            rag_results = _attack_memory.search_hybrid(query, top_k=3, success_only=True)
+            if rag_results:
+                lines.append("")
+                lines.append(f"RAG: {len(rag_results)} similar past attacks found:")
+                for r in rag_results:
+                    lines.append(f"  - {r.get('target', '?')}: {r.get('scenario', '?')[:60]}")
+        except Exception as exc:
+            logger.debug("RAG search failed: %s", exc)
     for i, h in enumerate(hypotheses, 1):
         lines.append(f"  {i}. [{h.confidence:.2f}] {h.description}")
         if h.verification_method:
@@ -481,8 +518,94 @@ def generate_hypotheses() -> str:
 
 
 # ---------------------------------------------------------------------------
+# save_mission — persist attack knowledge to RAG (Sprint 10)
+# ---------------------------------------------------------------------------
+
+def save_mission(target: str, scenario: str, success: bool = True) -> str:
+    """Save current mission results to RAG memory for cross-session learning.
+
+    Call this after completing an engagement to persist attack knowledge.
+    Saves attack details and tool strategy to PostgreSQL for future retrieval.
+    """
+    if not _attack_memory:
+        return "RAG not available (PostgreSQL not connected)."
+    if not _state_store:
+        return "StateStore is empty. Nothing to save."
+
+    hosts = _state_store.get_hosts()
+    if not hosts:
+        return "No hosts in StateStore. Nothing to save."
+
+    # Collect tools used and CVEs from StateStore
+    tools_used = set()
+    cves = set()
+    tags = ["phantom"]
+    for host in hosts:
+        vulns = _state_store.get_vulnerabilities_for_host(host.id)
+        for v in vulns:
+            if v.cve_id:
+                cves.add(v.cve_id)
+        if host.hostname:
+            tags.append(host.hostname)
+
+    # Collect tools from EGATS tree if available
+    if _egats_tree:
+        for node in _egats_tree.nodes.values():
+            if node.tool_used:
+                tools_used.add(node.tool_used)
+
+    try:
+        attack_id = _attack_memory.save_attack(
+            target=target,
+            scenario=scenario,
+            tools_used=list(tools_used) if tools_used else [],
+            cve_exploited=list(cves),
+            success=success,
+            tags=tags,
+        )
+
+        strategy_id = None
+        if _strategy_memory and _strategy_memory.is_available:
+            actions = [{"tool": t} for t in tools_used] if tools_used else []
+            strategy_id = _strategy_memory.extract_strategy(
+                actions=actions,
+                target=target,
+                objective=scenario,
+                success=success,
+                attack_id=attack_id,
+                tags=tags,
+            )
+
+        lines = [f"Mission saved to RAG:"]
+        lines.append(f"  Attack ID: {attack_id}")
+        if strategy_id:
+            lines.append(f"  Strategy ID: {strategy_id}")
+        lines.append(f"  Target: {target}")
+        lines.append(f"  CVEs: {', '.join(cves) if cves else 'none'}")
+        lines.append(f"  Tools: {', '.join(sorted(tools_used)) if tools_used else 'none'}")
+        lines.append(f"  Success: {success}")
+        return "\n".join(lines)
+
+    except Exception as exc:
+        logger.error("save_mission failed: %s", exc)
+        return f"Failed to save mission: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # FastMCP server setup
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# PreValidator (Sprint 5) — validate tool inputs before execution
+# ---------------------------------------------------------------------------
+try:
+    from execution.pre_validator import PreValidator
+
+    _pre_validator = PreValidator(state_store=_state_store, scope_checker=None)
+    logger.info("PreValidator loaded")
+except Exception as exc:
+    logger.warning("PreValidator not available: %s", exc)
+    _pre_validator = None
 
 mcp = FastMCP("Phantom Security Tools")
 
@@ -519,10 +642,17 @@ def _strip_kwargs(func):
 
 
 def _make_tool_wrapper(original_func, tool_name: str):
-    """Wrap a tool function with post-processing (ErrorHandler + StateStore)."""
+    """Wrap a tool function with pre-validation and post-processing."""
 
     @functools.wraps(original_func)
     def wrapper(**kwargs):
+        # Pre-validation (Sprint 5)
+        if _pre_validator:
+            ok, msg = _pre_validator.validate(tool_name, kwargs)
+            if not ok:
+                logger.warning("PreValidator rejected %s: %s", tool_name, msg)
+                return msg
+
         result = original_func(**kwargs)
         result_str = str(result)
         _post_tool_processing(tool_name, kwargs, result_str)
@@ -571,6 +701,12 @@ generate_hypotheses.__name__ = "generate_hypotheses"
 generate_hypotheses.__qualname__ = "generate_hypotheses"
 mcp.add_tool(generate_hypotheses)
 _registered.add("generate_hypotheses")
+
+# Register save_mission (Sprint 10)
+save_mission.__name__ = "save_mission"
+save_mission.__qualname__ = "save_mission"
+mcp.add_tool(save_mission)
+_registered.add("save_mission")
 
 logger.info("MCP bridge ready: %d tools registered", len(_registered))
 
