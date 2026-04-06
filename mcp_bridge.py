@@ -59,20 +59,165 @@ except Exception as exc:
     _state_store = None
 
 # ---------------------------------------------------------------------------
-# Post-tool processing: ErrorHandler + StateStore
+# Post-tool processing: ErrorHandler + StateStore (3-layer extraction)
 # ---------------------------------------------------------------------------
 
-# nmap output parsing patterns
-_NMAP_STANDARD = re.compile(r"(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)")
-_NMAP_PHANTOM = re.compile(r"(\d+)/(tcp|udp)\s+(\S+)\s+(.*)")
+# Layer 1: Universal patterns (applied to ALL tool outputs)
 _CVE_PATTERN = re.compile(r"CVE-\d{4}-\d+")
+_FQDN_PATTERN = re.compile(r"\b([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.(?:[a-zA-Z0-9-]+\.)*[a-zA-Z]{2,})\b")
 
 _ERROR_KEYWORDS = frozenset(["error", "fail", "denied", "refused", "timeout",
                               "timed out", "unreachable", "blocked"])
 
+# Layer 2: Tool-specific rules (declarative — add entry for new tools)
+_STATESTORE_RULES: dict[str, dict] = {
+    "run_nmap": {
+        "register_host": True,
+        "service_patterns": [
+            re.compile(r"(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)"),   # nmap standard
+            re.compile(r"(\d+)/(tcp|udp)\s+(\S+)\s+(.*)"),                      # Phantom formatted
+        ],
+    },
+    "run_ffuf": {
+        "register_host": True,
+        "vhost_extraction": True,
+    },
+    "run_whatweb": {
+        "register_host": True,
+    },
+    "run_nuclei": {
+        "register_host": True,
+    },
+    "run_recon": {
+        "register_host": True,
+        "fqdn_as_hosts": True,
+    },
+    "run_sqlmap": {
+        "register_host": True,
+    },
+    "run_wpscan": {
+        "register_host": True,
+    },
+    "run_graphql_enum": {
+        "register_host": True,
+    },
+    "run_hydra": {
+        "register_host": True,
+        "credential_pattern": re.compile(r"login:\s*(\S+)\s+password:\s*(\S+)"),
+    },
+    # Tools not listed here → Layer 1 only (CVE + FQDN universal extraction)
+}
+
+
+def _ensure_host(target: str) -> str:
+    """Ensure a host exists in StateStore, return host_id."""
+    host = _state_store.get_host_by_ip(target)
+    if host:
+        return host.id
+    host = _state_store.get_host_by_hostname(target)
+    if host:
+        return host.id
+    # Determine if target is IP or hostname
+    if re.match(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", target):
+        return _state_store.add_host(HostEntity(ip_address=target))
+    else:
+        return _state_store.add_host(HostEntity(ip_address="", hostname=target))
+
+
+def _extract_services(result: str, host_id: str, patterns: list) -> None:
+    """Extract services from tool output using pattern list."""
+    for line in result.splitlines():
+        stripped = line.strip()
+        for pattern in patterns:
+            m = pattern.match(stripped)
+            if m:
+                groups = m.groups()
+                if len(groups) >= 4:
+                    # Standard: port, proto, state, svc, ver
+                    port, proto, svc, ver = int(groups[0]), groups[1], groups[3], groups[4] if len(groups) > 4 else ""
+                elif len(groups) >= 3:
+                    # Phantom: port, proto, svc, ver
+                    port, proto, svc, ver = int(groups[0]), groups[1], groups[2], groups[3] if len(groups) > 3 else ""
+                else:
+                    continue
+                existing = _state_store.get_services_for_host(host_id)
+                if not any(s.port == port and s.protocol == proto for s in existing):
+                    _state_store.add_service(ServiceEntity(
+                        host_id=host_id, port=port, protocol=proto,
+                        service_name=svc, version=(ver.strip() if ver else None),
+                    ))
+                break  # First matching pattern wins
+
+
+def _extract_vhosts(result: str, tool_input: dict) -> None:
+    """Extract vhost subdomains from ffuf output and register as Hosts."""
+    url = tool_input.get("url", "")
+    # Extract base domain from FUZZ URL (e.g., "https://FUZZ.kobold.htb/" → "kobold.htb")
+    base_match = re.search(r"FUZZ\.([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", url)
+    if not base_match:
+        return
+    base_domain = base_match.group(1)
+
+    # ffuf output lines: "subdomain [Status: 200, Size: 1234]"
+    for line in result.splitlines():
+        vhost_match = re.match(r"\s*(\S+)\s+\[Status:\s*(\d+)", line.strip())
+        if vhost_match:
+            label = vhost_match.group(1)
+            status = int(vhost_match.group(2))
+            if status < 400:
+                fqdn = f"{label}.{base_domain}"
+                if not _state_store.get_host_by_hostname(fqdn):
+                    _state_store.add_host(HostEntity(ip_address="", hostname=fqdn))
+                    logger.info("StateStore: vhost registered: %s", fqdn)
+
+
+def _extract_cves(result: str, host_id: str) -> None:
+    """Layer 1: Extract CVE IDs from any tool output."""
+    cve_matches = _CVE_PATTERN.findall(result)
+    if not cve_matches:
+        return
+    existing_vulns = _state_store.get_vulnerabilities_for_host(host_id)
+    existing_cves = {v.cve_id for v in existing_vulns}
+    for cve in set(cve_matches):
+        if cve not in existing_cves:
+            _state_store.add_vulnerability(VulnerabilityEntity(
+                host_id=host_id, cve_id=cve, description=f"Detected in tool output",
+            ))
+
+
+def _extract_fqdns(result: str) -> None:
+    """Layer 1: Extract FQDNs from any tool output and register as Hosts."""
+    fqdns = _FQDN_PATTERN.findall(result)
+    # Filter out common false positives (tool names, doc sites, etc.)
+    skip = {"example.com", "localhost", "nmap.org", "github.com", "exploit-db.com",
+            "crt.sh", "hackertarget.com", "securitytrails.com", "shodan.io",
+            "owasp.org", "wikipedia.org", "google.com", "anthropic.com"}
+    for fqdn in set(fqdns):
+        if fqdn.lower() in skip:
+            continue
+        if not _state_store.get_host_by_hostname(fqdn):
+            _state_store.add_host(HostEntity(ip_address="", hostname=fqdn))
+
+
+def _extract_credentials(result: str, host_id: str, pattern: re.Pattern) -> None:
+    """Extract credentials from tool output."""
+    from memory.entity_models import CredentialEntity
+    for m in pattern.finditer(result):
+        username, password = m.group(1), m.group(2)
+        _state_store.add_credential(CredentialEntity(
+            username=username, credential_type="password",
+            credential_value=password, valid_for=[host_id],
+        ))
+
 
 def _post_tool_processing(tool_name: str, tool_input: dict, result: str) -> None:
-    """Run ErrorHandler classification and StateStore registration after tool execution."""
+    """Run ErrorHandler classification and StateStore registration after tool execution.
+
+    Uses 3-layer extraction architecture:
+    Layer 1: Universal (CVE + FQDN) — applied to all tools
+    Layer 2: Tool-specific rules from _STATESTORE_RULES
+    Layer 3: Findings-based (handled upstream by existing code)
+    """
 
     # --- ErrorHandler ---
     if _error_handler and result:
@@ -88,66 +233,43 @@ def _post_tool_processing(tool_name: str, tool_input: dict, result: str) -> None
                     recovery.suggestion,
                 )
 
-    # --- StateStore ---
+    # --- StateStore (3-layer extraction) ---
     if not _state_store:
         return
     if result.startswith("Error") or result.startswith("SCOPE VIOLATION"):
         return
 
     target = tool_input.get("target", tool_input.get("url", ""))
-    if not target:
-        return
 
     try:
-        # nmap → Host + Service
-        if tool_name == "run_nmap":
-            host = _state_store.get_host_by_ip(target)
-            if not host:
-                host_id = _state_store.add_host(HostEntity(ip_address=target))
-            else:
-                host_id = host.id
+        rules = _STATESTORE_RULES.get(tool_name, {})
 
-            for line in result.splitlines():
-                port, proto, svc, ver = None, None, None, None
-                # Pattern 1: nmap standard (port/tcp open service version)
-                m = _NMAP_STANDARD.match(line.strip())
-                if m:
-                    port, proto, svc, ver = m.group(1), m.group(2), m.group(4), m.group(5)
-                else:
-                    # Pattern 2: Phantom formatted (port/tcp service version)
-                    m = _NMAP_PHANTOM.match(line.strip())
-                    if m:
-                        port, proto, svc, ver = m.group(1), m.group(2), m.group(3), m.group(4)
+        # Layer 2: register_host
+        host_id = None
+        if target and rules.get("register_host"):
+            host_id = _ensure_host(target)
 
-                if port:
-                    p = int(port)
-                    existing = _state_store.get_services_for_host(host_id)
-                    if not any(s.port == p and s.protocol == proto for s in existing):
-                        _state_store.add_service(ServiceEntity(
-                            host_id=host_id,
-                            port=p,
-                            protocol=proto,
-                            service_name=svc,
-                            version=(ver.strip() if ver else None),
-                        ))
+        # Layer 2: service_patterns (nmap etc.)
+        if host_id and rules.get("service_patterns"):
+            _extract_services(result, host_id, rules["service_patterns"])
 
-        # All tools: CVE ID detection → Vulnerability registration
-        cve_matches = _CVE_PATTERN.findall(result)
-        if cve_matches and target:
-            host = _state_store.get_host_by_ip(target)
-            if not host:
-                host_id = _state_store.add_host(HostEntity(ip_address=target))
-            else:
-                host_id = host.id
-            existing_vulns = _state_store.get_vulnerabilities_for_host(host_id)
-            existing_cves = {v.cve_id for v in existing_vulns}
-            for cve in set(cve_matches):
-                if cve not in existing_cves:
-                    _state_store.add_vulnerability(VulnerabilityEntity(
-                        host_id=host_id,
-                        cve_id=cve,
-                        description=f"Detected by {tool_name}",
-                    ))
+        # Layer 2: vhost_extraction (ffuf)
+        if rules.get("vhost_extraction"):
+            _extract_vhosts(result, tool_input)
+
+        # Layer 2: credential_pattern (hydra etc.)
+        if host_id and rules.get("credential_pattern"):
+            _extract_credentials(result, host_id, rules["credential_pattern"])
+
+        # Layer 2: fqdn_as_hosts (recon — register all FQDNs as hosts)
+        if rules.get("fqdn_as_hosts"):
+            _extract_fqdns(result)
+
+        # Layer 1: Universal CVE extraction (all tools)
+        if target:
+            if not host_id:
+                host_id = _ensure_host(target)
+            _extract_cves(result, host_id)
 
     except Exception as exc:
         logger.debug("StateStore registration failed: %s", exc)

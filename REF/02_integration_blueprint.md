@@ -1181,61 +1181,83 @@ self._state_store = StateStore(db_path=session_db_path)
 self._register_to_state_store(tool_name, tc.get("input", {}), content, findings)
 ```
 
-**全27ツールのStateStore登録対応計画**:
+**StateStore登録の汎用アーキテクチャ（3層エクストラクション）**:
 
-StateStoreは5エンティティ（Host, Service, Vulnerability, Credential, Session）を管理する。全27ツールの出力がどのエンティティに対応するかを以下に分類する。ツール対応は段階的に実装し、各スプリントで対応するツールのみを追加する。
+ツールの出力からStateStoreにエンティティを登録する仕組みは、ツールごとに個別パーサーを書くのではなく、3層の汎用アーキテクチャで処理する。新ツール追加時はルール辞書にエントリを1つ追加するだけでよい。
 
-**スプリント2で対応（偵察基盤 — 最小限の2ツール）**:
+```
+層1: 全ツール共通（自動適用、コード変更不要）
+  - CVE-XXXX-XXXXX → Vulnerability登録（正規表現で全出力から抽出）
+  - FQDN抽出 → Host登録（ドメイン名パターンで全出力から抽出）
 
-| ツール | 出力に含まれる情報 | 登録エンティティ | パース方法 |
-|---|---|---|---|
-| `run_nmap` | IPアドレス、ポート番号、プロトコル、サービス名、バージョン、OS推定 | **Host** + **Service** | ポート行の正規表現（`\d+/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)`） |
-| `run_nuclei` | CVE番号、重要度、対象URL、脆弱性説明 | **Vulnerability** | 既存`_extract_findings()`のFinding.cve_idから二次登録 |
+層2: ツール別ルール辞書（宣言的定義、_STATESTORE_RULESに追加するだけ）
+  - register_host: input.targetをHost登録するか
+  - service_patterns: ポート/サービス行を抽出する正規表現リスト
+  - vhost_extraction: vhostサブドメインをHost登録するか
 
-**スプリント6で対応（偵察拡張+脆弱性スキャン — 6ツール）**:
+層3: Findingsからの二次登録（既存、変更不要）
+  - Finding.cve_id → Vulnerability（CVE汎用抽出と重複排除済み）
+```
 
-| ツール | 出力に含まれる情報 | 登録エンティティ | パース方法 |
-|---|---|---|---|
-| `run_whatweb` | テクノロジー（CMS、フレームワーク、サーバー種別/バージョン） | **Service.version の更新**（既存サービスに技術情報を追記） | 既存ツール出力のキーワードマッチ |
-| `run_recon` | サブドメイン一覧（CRT.sh、HackerTarget） | **Host**（発見したサブドメインをホストとして登録） | 出力行からドメイン名を抽出 |
-| `run_ffuf` | vhostサブドメイン / ディレクトリパス | vhost使用時: **Host**（サブドメイン登録）。ディレクトリ: StateStore対象外（Findingとして既存MissionMemoryに記録） | ffuf JSON出力のHost行を判定 |
-| `run_sqlmap` | 脆弱パラメータ名、攻撃種別（UNION/blind/time-based）、DB名、テーブル名 | **Vulnerability**（CVE番号なし、descriptionにパラメータ名+攻撃種別を記録） | 「is vulnerable」「Type:」行のパース |
-| `run_wpscan` | WPバージョン、ユーザー名列挙、プラグイン脆弱性CVE | **Vulnerability** + **Credential**（ユーザー名列挙結果、credential_type="username_only"） | WPScan出力のセクション別パース |
-| `run_graphql_enum` | GraphQLスキーマ、イントロスペクション有無、機密フィールド | **Vulnerability**（イントロスペクション有効=設定ミスとして登録） | 「introspection enabled」等のキーワード |
+**ツール別ルール辞書（mcp_bridge.py内、宣言的定義）**:
 
-**スプリント7で対応（エクスプロイト+横展開 — 6ツール）**:
+```python
+_STATESTORE_RULES = {
+    "run_nmap": {
+        "register_host": True,
+        "service_patterns": [
+            r"(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)",  # nmap標準
+            r"(\d+)/(tcp|udp)\s+(\S+)\s+(.*)",                     # Phantom整形
+        ],
+    },
+    "run_ffuf": {
+        "register_host": True,
+        "vhost_extraction": True,   # vhost結果からサブドメインHost登録
+    },
+    "run_whatweb": {
+        "register_host": True,
+    },
+    "run_nuclei": {
+        "register_host": True,
+    },
+    "run_recon": {
+        "register_host": True,
+        "fqdn_extraction": True,    # 出力からFQDNを抽出してHost登録
+    },
+    "run_hydra": {
+        "register_host": True,
+        "credential_patterns": [r"login:\s*(\S+)\s+password:\s*(\S+)"],
+    },
+    # 定義がないツール → 層1（CVE汎用+FQDN汎用）のみ適用
+}
+```
 
-| ツール | 出力に含まれる情報 | 登録エンティティ | パース方法 |
-|---|---|---|---|
-| `run_hydra` | 有効なユーザー名:パスワード | **Credential**（credential_type="password"、valid_for=[host_id]） | 「login:」「password:」行のパース |
-| `run_jwt_attacks` | JWTトークン、弱シークレット、偽造トークン | **Credential**（credential_type="jwt_token" or "jwt_secret"） | 「Secret:」「Token:」行のパース |
-| `run_metasploit` | セッション取得結果、Meterpreterシェル | **Session**（session_type="meterpreter" or "shell"） + **Credential** | 「session opened」行のパース |
-| `fetch_exploit` | PoC実行結果、エクスプロイト成功/失敗 | **Vulnerability.exploitation_status の更新**（"discovered"→"exploited"） | 実行結果のキーワード判定 |
-| `forge_tool` | カスタムスクリプト実行結果（シェル取得、ファイル読取等） | **Session**（シェル取得時） + **Credential**（クレデンシャル発見時） | 出力内容によりパターンマッチ（「shell」「password」「token」等） |
-| `run_privesc_check` | SUID/sudo/cron列挙結果、権限昇格パス | **Vulnerability**（exploitation_status="privesc_path"） | SUID行、sudo行のパース |
-| `run_bettercap` | ネットワークプローブで発見したホスト | **Host** | ARP応答からIP+MACアドレス抽出 |
+**汎用エンジンの処理フロー**:
 
-**StateStore対象外のツール（15ツール）**:
+```python
+def _post_tool_processing(tool_name, tool_input, result):
+    # 層1: 全ツール共通
+    _extract_cves(result, target)          # CVE → Vulnerability（既に実装済み）
+    _extract_fqdns(result, target)         # FQDN → Host（新規追加）
 
-以下のツールはHost/Service/Vulnerability/Credential/Sessionのいずれにも直接対応するデータを出力しないため、StateStoreへの登録は行わない。これらの出力は既存のMissionMemory（Finding/ActionRecord）で引き続き管理される。
+    # 層2: ツール別ルール
+    rules = _STATESTORE_RULES.get(tool_name, {})
+    if rules.get("register_host"):
+        _ensure_host(target)
+    if rules.get("service_patterns"):
+        _extract_services(result, host_id, rules["service_patterns"])
+    if rules.get("vhost_extraction"):
+        _extract_vhosts(result, target)
+    if rules.get("credential_patterns"):
+        _extract_credentials(result, host_id, rules["credential_patterns"])
+```
 
-| ツール | 理由 |
-|---|---|
-| `check_scope` | スコープ判定結果。エンティティではない |
-| `configure_auth` | 認証設定操作。発見ではない |
-| `set_stealth_profile` | プロファイル変更。発見ではない |
-| `take_screenshot` | 証拠画像パス。エンティティではない |
-| `generate_report` | レポート生成。エンティティではない |
-| `read_log` | ログ表示。新しい情報ではない |
-| `calculate_risk_score` | スコア計算。エンティティではない |
-| `compare_missions` | セッション差分。エンティティではない |
-| `run_payloads` | ペイロードリスト提供。発見ではない |
-| `cleanup_temp` | ファイル削除。発見ではない |
-| `request_human_input` | 人間の応答。エンティティではない |
-| `generate_phish_template` | テンプレート生成。エンティティではない |
-| `generate_zphisher_template` | テンプレート生成。エンティティではない |
+**新ツール追加時の手順**:
+1. `tools/` にツールファイルを追加（既存パターン通り）
+2. `_STATESTORE_RULES` にエントリを追加（該当するルールのみ。なければ空で層1のみ適用）
+3. 完了。個別パーサーのコード追加は不要。
 
-**注: niktoについて**: Phantomの27ツールにniktoは含まれていない。niktoの機能はnuclei（CVE/設定ミススキャン）とwhatweb（テクノロジー検出）でカバーされている。将来的にniktoを追加する場合は、run_nucleiと同じVulnerabilityエンティティへの登録パターンを使用する。
+**注: niktoについて**: Phantomの27ツールにniktoは含まれていない。niktoの機能はnuclei（CVE/設定ミススキャン）とwhatweb（テクノロジー検出）でカバーされている。将来的にniktoを追加する場合は、`_STATESTORE_RULES` に `"run_nikto": {"register_host": True}` を追加するだけでよい（CVEは層1で自動抽出）。
 
 スプリント2ではnmapとnucleiのみに対応する。これらは既存の `_extract_findings_from_tool_output()` が既にパースしている情報を、StateStoreのエンティティとして二次的に登録する形で実装する。新しいパーサーは書かない。
 
