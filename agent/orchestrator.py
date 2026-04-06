@@ -150,6 +150,20 @@ class Orchestrator:
             logger.warning("ErrorHandler not available: %s", exc)
             self._error_handler = None
 
+        # ------ State store (Sprint 2) ------
+        try:
+            from memory.state_store import StateStore as _StateStore
+
+            session_db_path = (
+                os.path.join(self.session_dir, "state_store.db")
+                if self.session_dir
+                else ":memory:"
+            )
+            self._state_store: Optional[Any] = _StateStore(db_path=session_db_path)
+        except Exception as exc:
+            logger.warning("StateStore not available: %s", exc)
+            self._state_store = None
+
         # ------ Mission state machine ------
         self.mission_state = MissionState(mission_id=self.mission_id)
 
@@ -318,6 +332,29 @@ class Orchestrator:
             lines.append(
                 f"Targets: {json.dumps(self.attack_state.target_model, separators=(',', ':'))}"
             )
+
+        # StateStore summary (Sprint 2) — adds structured host/service/vuln details
+        if self._state_store:
+            try:
+                hosts = self._state_store.get_hosts()
+                if hosts:
+                    lines.append("## StateStore")
+                    for host in hosts:
+                        services = self._state_store.get_services_for_host(host.id)
+                        vulns = self._state_store.get_vulnerabilities_for_host(host.id)
+                        svc_str = ", ".join(
+                            f"{s.port}/{s.service_name}" for s in services
+                        )
+                        lines.append(
+                            f"  {host.ip_address} ({host.hostname or '?'}): {svc_str}"
+                        )
+                        for v in vulns:
+                            lines.append(
+                                f"    [{v.exploitation_status}] {v.cve_id}: "
+                                f"{v.description[:60]}"
+                            )
+            except Exception as exc:
+                logger.debug("StateStore summary failed: %s", exc)
 
         return "\n".join(lines)
 
@@ -957,6 +994,9 @@ class Orchestrator:
                 except Exception as exc:
                     logger.debug("MissionMemory update failed: %s", exc)
 
+            # Register entities to StateStore (Sprint 2)
+            self._register_to_state_store(tool_name, tc.get("input", {}), content, findings)
+
             # Update attack graph with discovered entities
             self._update_graph_from_results(
                 tool_name, tc.get("input", {}), content, findings
@@ -1023,6 +1063,76 @@ class Orchestrator:
                 )
 
         return findings
+
+    def _register_to_state_store(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        content: str,
+        findings: list,
+    ) -> None:
+        """Register discovered entities to StateStore (Sprint 2).
+
+        Currently handles nmap (Host + Service) and nuclei (Vulnerability).
+        Additional tools will be added in Sprint 6 and Sprint 7.
+        """
+        if not self._state_store:
+            return
+
+        target = tool_input.get("target", tool_input.get("url", ""))
+        if not target:
+            return
+
+        try:
+            from memory.entity_models import HostEntity, ServiceEntity, VulnerabilityEntity
+
+            # nmap: parse port lines → Host + Service
+            if tool_name in ("run_nmap",) and not content.startswith("Error"):
+                host = self._state_store.get_host_by_ip(target)
+                if not host:
+                    host_id = self._state_store.add_host(HostEntity(ip_address=target))
+                else:
+                    host_id = host.id
+
+                for line in content.splitlines():
+                    match = re.match(
+                        r"(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)",
+                        line.strip(),
+                    )
+                    if match:
+                        port = int(match.group(1))
+                        # Avoid duplicate services
+                        existing = self._state_store.get_services_for_host(host_id)
+                        if not any(s.port == port and s.protocol == match.group(2) for s in existing):
+                            self._state_store.add_service(ServiceEntity(
+                                host_id=host_id,
+                                port=port,
+                                protocol=match.group(2),
+                                service_name=match.group(4),
+                                version=match.group(5).strip() or None,
+                            ))
+
+            # nuclei / any tool: Finding with cve_id → Vulnerability
+            for finding in findings:
+                if getattr(finding, "cve_id", None):
+                    host = self._state_store.get_host_by_ip(target)
+                    if not host:
+                        host_id = self._state_store.add_host(HostEntity(ip_address=target))
+                    else:
+                        host_id = host.id
+
+                    # Avoid duplicate vulnerabilities
+                    existing_vulns = self._state_store.get_vulnerabilities_for_host(host_id)
+                    if not any(v.cve_id == finding.cve_id for v in existing_vulns):
+                        self._state_store.add_vulnerability(VulnerabilityEntity(
+                            host_id=host_id,
+                            cve_id=finding.cve_id,
+                            description=getattr(finding, "title", ""),
+                            exploitation_status="discovered",
+                        ))
+
+        except Exception as exc:
+            logger.debug("StateStore registration failed: %s", exc)
 
     def _extract_findings_from_tool_output(
         self, content: str, tool_name: str, tool_input: dict
