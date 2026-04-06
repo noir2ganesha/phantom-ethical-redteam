@@ -173,6 +173,79 @@ def get_state_summary() -> str:
 
 
 # ---------------------------------------------------------------------------
+# generate_hypotheses — 4-layer hypothesis generation (Sprint 6)
+# ---------------------------------------------------------------------------
+
+try:
+    from reasoning.hypothesis_engine import HypothesisEngine as _HypothesisEngine
+
+    _hypothesis_engine = _HypothesisEngine()
+    logger.info("HypothesisEngine loaded (4-layer: rule/output/rag/llm)")
+except Exception as exc:
+    logger.warning("HypothesisEngine not available: %s", exc)
+    _hypothesis_engine = None
+
+
+def generate_hypotheses() -> str:
+    """Generate attack hypotheses based on current StateStore state.
+
+    Uses 4-layer hypothesis generation:
+    Layer 1 (Rule): port/service rules + PRODUCT_CATALOG (18+ products)
+                    + SSRF_HOSTNAME_PATTERNS (9 categories, 70+ patterns)
+    Layer 2 (Output): tool output pattern matching
+    Layer 3 (RAG): stub (future Sprint 11)
+    Layer 4 (LLM): stub (not available in MCP bridge mode)
+    """
+    if not _hypothesis_engine:
+        return "HypothesisEngine is not available."
+    if not _state_store:
+        return "StateStore is empty. Run reconnaissance tools first."
+
+    hosts = _state_store.get_hosts()
+    if not hosts:
+        return "No hosts discovered yet. Run run_nmap first."
+
+    # Build context from StateStore
+    services_list = []
+    domains_list = []
+    for host in hosts:
+        for svc in _state_store.get_services_for_host(host.id):
+            services_list.append({
+                "host": host.ip_address,
+                "port": svc.port,
+                "service": svc.service_name or "",
+                "product": svc.version.split()[0] if svc.version else "",
+                "version": svc.version or "",
+            })
+        if host.hostname:
+            domains_list.append({"domain": host.hostname})
+
+    context = {
+        "target": hosts[0].ip_address,
+        "services": services_list,
+        "state_snapshot": {"domains": domains_list},
+        "findings": [],
+        "phase": "recon",
+    }
+
+    try:
+        hypotheses = _hypothesis_engine.generate_hypotheses(context)
+    except Exception as exc:
+        logger.error("Hypothesis generation failed: %s", exc)
+        return f"Hypothesis generation failed: {exc}"
+
+    if not hypotheses:
+        return "No hypotheses generated. More reconnaissance data may be needed."
+
+    lines = [f"Generated {len(hypotheses)} hypotheses:"]
+    for i, h in enumerate(hypotheses, 1):
+        lines.append(f"  {i}. [{h.confidence:.2f}] {h.description}")
+        if h.verification_method:
+            lines.append(f"     verify: {h.verification_method[:80]}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # FastMCP server setup
 # ---------------------------------------------------------------------------
 
@@ -258,7 +331,13 @@ get_state_summary.__qualname__ = "get_state_summary"
 mcp.add_tool(get_state_summary)
 _registered.add("get_state_summary")
 
-logger.info("MCP bridge ready: %d tools registered (including get_state_summary)", len(_registered))
+# Register generate_hypotheses (Sprint 6)
+generate_hypotheses.__name__ = "generate_hypotheses"
+generate_hypotheses.__qualname__ = "generate_hypotheses"
+mcp.add_tool(generate_hypotheses)
+_registered.add("generate_hypotheses")
+
+logger.info("MCP bridge ready: %d tools registered", len(_registered))
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
