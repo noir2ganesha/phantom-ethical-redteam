@@ -1634,7 +1634,7 @@ mcp.add_tool(get_state_summary)
 1. ユニットテスト: `_post_tool_processing()` に実際のnmap出力（Phantom整形形式+標準形式）を渡し、StateStoreに正しくサービスが登録されることを確認。エラー出力でErrorHandlerが正しく分類されることを確認
 2. MCPツール検証: `get_state_summary` がStateStoreの現在の状態を正しく返すことを確認
 3. **統合テスト（Claude Code CLI経由）**: Claude Code CLIからMCPツール（run_nmap等）を呼出し、`get_state_summary`で登録結果を確認。ErrorHandlerのログがMCPサーバーのログに出力されることを確認
-4. 回帰テスト: 既存462テスト全パス + MCPブリッジで28ツール（27+get_state_summary）が登録されること
+4. 回帰テスト: 既存テスト全パス + MCPブリッジで29ツール（27 + get_state_summary + generate_hypotheses）が登録されること
 
 ---
 
@@ -1729,7 +1729,7 @@ class PreValidator:
 1. ユニットテスト: PreValidator単体で不正パラメータが拒否されることを確認
 2. **Orchestrator統合テスト（上記5テスト）**: _execute_tool/observe_phase/format_state_summaryの実データフロー検証
 3. 統合テスト: Orchestratorの`_execute_tool()`が事前バリデーション失敗時にツール実行をスキップすることを確認
-4. 回帰テスト: 既存462テスト全パス（Sprint1: 39 + Sprint2: 25 + Sprint3: 35 + 既存363）
+4. 回帰テスト: 既存テスト全パス（Sprint1: 39 + Sprint2: 25 + Sprint3: 35 + Sprint4: 18 + Sprint6: 25 + 既存363 = 505+）
 
 ---
 
@@ -1764,13 +1764,17 @@ class PreValidator:
 
 2. 実データ検証: kobold.htbのStateStoreデータ（4ポート、2サブドメイン）を入力し、MCPJam RCE仮説がconfidence 0.75で生成されることを確認。devarea.htbデータ（6ポート、Hoverfly/Jetty）でも仮説生成が妥当であることを確認
 
-3. 回帰テスト: 既存462+テスト全パス + 既存のburst_launch()も引き続き動作すること
+3. 回帰テスト: 既存テスト全パス（507+） + 既存のburst_launch()も引き続き動作すること
 
 ---
 
-#### スプリント7: EGATS Forest + Orchestrator統合（最大の改修スプリント）
+#### スプリント7: EGATS Forest + MCPブリッジ統合
 
-**目的**: EGATS（スプリント4）とStateStore（スプリント2）をForestUCBで統合し、OrchestratorのPAORループに組み込む。kobold.htbのF3（13分行き詰まり → 自動ピボット）を解決する。
+**目的**: EGATS（スプリント3）をMCPブリッジに接続し、ツール実行結果のbackpropagation（promise_score更新）と枝刈りによる自動ピボットを実現する。kobold.htbのF3（13分行き詰まり → 自動ピボット）を解決する。
+
+**注: 設計変更（Sprint 4で判明）**: 当初はOrchestrator経由でEGATSを統合する計画だったが、実際の運用経路がMCPブリッジであること、OrchestratorにはAPIポリシーリスクとcircular import問題があることが判明したため、EGATSもMCPブリッジに直接接続する。
+
+**注: Orchestrator内のdead code**: Sprint 1-2でOrchestratorに追加したErrorHandler/StateStore接続コード（orchestrator.py内の約36行）は、MCPブリッジ構成では使用されない。現時点では残しておくが（Orchestrator直接使用モードの将来的な復活に備え）、実際の運用経路はMCPブリッジである。
 
 **移植元**: Nirvana `nirvana/planner/forest.py`（293行）
 
@@ -1863,7 +1867,7 @@ def _reflect_phase(self):
 
 4. devarea.htbデータ（6ポート、Hoverfly/Jetty/FTP）でも同様のフローを検証
 
-5. 回帰テスト: 既存462+テスト全パス + EGATS無効時（`_forest = None`）に既存動作が維持されること
+5. 回帰テスト: 既存テスト全パス（507+） + EGATS無効時（`_forest = None`）に既存動作が維持されること
 
 6. **MCPブリッジ検証**: mcp_bridge.pyで全ツール（27+AD追加分）がFastMCPに登録されることを確認
 
@@ -2023,9 +2027,9 @@ class MemoryDistiller:
     │
 スプリント3(旧4): EGATS コア ←── 依存なし ✅ 完了
     │
-スプリント4: MCPブリッジ統合 ←── ErrorHandler(Sprint1) + StateStore(Sprint2) ← **次に実施**
-    │  （ErrorHandler/StateStoreをMCPブリッジに直接組込み。Orchestrator経由ではない）
-    │  （get_state_summary MCPツール追加）
+スプリント4: MCPブリッジ統合 ←── ErrorHandler(Sprint1) + StateStore(Sprint2) ✅ 完了
+    │  （ErrorHandler/StateStoreをMCPブリッジに直接組込み）
+    │  （get_state_summary + generate_hypotheses MCPツール追加、計29ツール）
     │
     ├── スプリント5: 事前バリデーション ←── MCPブリッジ統合 (スプリント4)
     │
