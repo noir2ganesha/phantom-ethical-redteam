@@ -1399,17 +1399,234 @@ if self._state_store:
 
 ---
 
-#### スプリント4(旧5): 事前バリデーション + Sprint 1〜3 Orchestrator統合テスト
+#### スプリント4: MCPブリッジ統合（ErrorHandler + StateStore組込み）
 
-**目的1: 事前バリデーション実装**: ツール実行前にパラメータの妥当性とStateStoreとの整合性を検証する。Co-RedTeamのValidation Agent概念をプログラム的に実装する。
+**目的**: Sprint 1〜3で作成したErrorHandlerとStateStoreを、実際の運用経路であるMCPブリッジに統合する。Orchestratorを経由せず、MCPブリッジのツールラッパー内でErrorHandler分類とStateStore登録を直接実行する。
 
-**目的2: Sprint 1〜3 の Orchestrator 統合テスト**: Sprint 1（ErrorHandler）と Sprint 2（StateStore `_register_to_state_store`）は Orchestrator に接続済みだが、Orchestrator 経由での動作確認が未実施。このスプリントで2段階の統合テストを行う：(1) `_execute_tool()` と `_observe_phase()` を個別に呼出してデータフローを確認、(2) 実際のLLM（OAuth認証/Max 20x、コスト発生なし）でOrchestratorの `run_mission()` を短縮実行（max_turns=3〜5）して全コンポーネントの接続を確認する。
+**背景（設計見直しの経緯）**:
 
-**新規ファイル**: `agent/execution/pre_validator.py`（~80行）, `tests/test_orchestrator_integration.py`
+統合テスト実施時に以下の事実が判明した：
 
-**改修ファイル**: `agent/orchestrator.py`（`_execute_tool()`に5行追加）
+1. **実際の運用経路はMCPブリッジ**であり、Orchestratorの`run_mission()`ではない。kobold.htb攻略もdevarea.htb偵察も、Claude Code CLI → MCPブリッジ → TOOL_REGISTRYの経路で実行された。
+2. **Orchestratorを直接使うとAPIポリシーリスクが発生する**。Orchestratorの`_plan_phase()`はClaude APIを直接呼出し、Claudeにbashコマンドを生成させるため、Nirvana/Excaliburと同じ問題が起きる。
+3. **OrchestratorにはTOOL_REGISTRYのcircular import問題がある**。`provider=None`で初期化してもTOOL_REGISTRYが0件になり、`_execute_tool()`が動作しない。
+4. **ErrorHandler/StateStoreはOrchestratorに依存しない完全独立モジュール**であり、MCPブリッジから直接使用できる。
 
-**依存**: StateStore（スプリント2）, ErrorHandler（スプリント1）
+**結論**: ErrorHandlerとStateStoreはOrchestratorではなくMCPブリッジに接続する。Orchestratorの`_execute_tool()`内のErrorHandler/StateStoreロジック（約30行）をMCPブリッジに移植する。
+
+**改修ファイル**: `mcp_bridge.py`
+
+**新規ファイル**: なし
+
+**他コンポーネントへの依存**: ErrorHandler（Sprint 1）、StateStore（Sprint 2）
+
+**解決する問題（精査で発見）**:
+
+**問題A: nmap正規表現がPhantom整形出力にマッチしない**
+
+Phantomの`run_nmap`ツールは出力を独自フォーマット（`port/tcp service version` — `open`フィールドなし）に整形する。Orchestratorの正規表現 `r'(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)'` はnmap標準形式を想定しており、Phantom出力にマッチしない。
+
+解決策: 2パターンを順番に試す。
+
+```python
+# パターン1: nmap標準形式 (port/tcp open service version)
+match = re.match(r'(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)', line.strip())
+if match:
+    port, proto, _state, svc, ver = match.groups()
+else:
+    # パターン2: Phantom整形形式 (port/tcp service version)
+    match = re.match(r'(\d+)/(tcp|udp)\s+(\S+)\s+(.*)', line.strip())
+    if match:
+        port, proto, svc, ver = match.groups()
+```
+
+**問題B: MCPブリッジのStateStore永続化パス**
+
+MCPサーバーはstdioプロセスとして常駐するがsession_dirの概念がない。
+
+解決策: `~/.phantom/state_store.db` に固定パスで保存する。ディレクトリが存在しなければ自動作成。MCPサーバープロセスが終了しても次回起動時にDBが復元される。
+
+```python
+import os
+PHANTOM_DIR = os.path.expanduser("~/.phantom")
+os.makedirs(PHANTOM_DIR, exist_ok=True)
+STATE_DB_PATH = os.path.join(PHANTOM_DIR, "state_store.db")
+```
+
+**問題C: StateStoreの状態をClaude Code CLIに伝える方法**
+
+ツール実行結果にStateStoreデータを追記すると結果改変になり、ツールの出力形式が変わってしまう。
+
+解決策: 新しいMCPツール `get_state_summary` を追加する。Claude Code CLIが明示的に呼出してStateStoreの現在の状態（ホスト、サービス、脆弱性一覧）を取得する。
+
+```python
+def get_state_summary() -> str:
+    """現在のStateStoreの状態サマリを返す。ホスト、サービス、脆弱性の一覧。"""
+    if not state_store:
+        return "StateStore is empty."
+    lines = []
+    for host in state_store.get_hosts():
+        services = state_store.get_services_for_host(host.id)
+        vulns = state_store.get_vulnerabilities_for_host(host.id)
+        svc_str = ", ".join(f"{s.port}/{s.service_name}" for s in services)
+        lines.append(f"{host.ip_address} ({host.hostname or '?'}): {svc_str}")
+        for v in vulns:
+            lines.append(f"  [{v.exploitation_status}] {v.cve_id}: {v.description[:60]}")
+    return "\n".join(lines) if lines else "No entities registered."
+```
+
+**注意事項D: quick scan出力のフォーマット問題**
+
+Phantomの`run_nmap(scan_type='quick')`は1行に2ポートが混在する出力（`21/tcp    ftp             22/tcp   open  ssh`）を返す場合がある。これはPhantomの出力整形の制約であり、service scan（`scan_type='service'`）の出力は1行1ポートの正常フォーマット。MCPブリッジのパーサーはservice scan出力を前提とし、quick scanの異常フォーマットは無視する（パースできない行はスキップ）。
+
+**MCPブリッジ改修設計**:
+
+```python
+# mcp_bridge.py の変更概要
+
+import os
+import re
+import logging
+from execution.error_handler import ErrorHandler, ErrorType
+from memory.state_store import StateStore
+from memory.entity_models import HostEntity, ServiceEntity, VulnerabilityEntity
+
+logger = logging.getLogger("phantom.mcp_bridge")
+
+# グローバル状態（MCPサーバープロセス常駐中に保持）
+PHANTOM_DIR = os.path.expanduser("~/.phantom")
+os.makedirs(PHANTOM_DIR, exist_ok=True)
+
+error_handler = ErrorHandler()
+state_store = StateStore(db_path=os.path.join(PHANTOM_DIR, "state_store.db"))
+
+def _post_tool_processing(tool_name: str, tool_input: dict, result: str) -> None:
+    """ツール実行後のErrorHandler分類 + StateStore登録。"""
+
+    # 1. ErrorHandler
+    _lower = result.lower()[:200]
+    if result and (
+        "error" in _lower or "fail" in _lower or "denied" in _lower
+        or "refused" in _lower or "timeout" in _lower
+        or "timed out" in _lower or "unreachable" in _lower
+        or "blocked" in _lower
+    ):
+        error_type = error_handler.classify(result, tool_name)
+        if error_type != ErrorType.UNKNOWN:
+            recovery = error_handler.recover(error_type, {"tool": tool_name})
+            logger.info("ErrorHandler: %s -> %s: %s", error_type.value, recovery.action.value, recovery.suggestion)
+
+    # 2. StateStore登録（エラー結果はスキップ）
+    if result.startswith("Error") or result.startswith("SCOPE VIOLATION"):
+        return
+
+    target = tool_input.get("target", tool_input.get("url", ""))
+    if not target:
+        return
+
+    try:
+        # nmap → Host + Service
+        if tool_name == "run_nmap":
+            host = state_store.get_host_by_ip(target)
+            if not host:
+                host_id = state_store.add_host(HostEntity(ip_address=target))
+            else:
+                host_id = host.id
+            for line in result.splitlines():
+                port, proto, svc, ver = None, None, None, None
+                # パターン1: nmap標準 (port/tcp open service version)
+                m = re.match(r"(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)", line.strip())
+                if m:
+                    port, proto, _, svc, ver = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+                else:
+                    # パターン2: Phantom整形 (port/tcp service version)
+                    m = re.match(r"(\d+)/(tcp|udp)\s+(\S+)\s+(.*)", line.strip())
+                    if m:
+                        port, proto, svc, ver = m.group(1), m.group(2), m.group(3), m.group(4)
+                if port:
+                    p = int(port)
+                    existing = state_store.get_services_for_host(host_id)
+                    if not any(s.port == p and s.protocol == proto for s in existing):
+                        state_store.add_service(ServiceEntity(
+                            host_id=host_id, port=p, protocol=proto,
+                            service_name=svc, version=(ver.strip() if ver else None),
+                        ))
+
+        # 全ツール共通: CVE ID検出 → Vulnerability登録
+        cve_matches = re.findall(r"CVE-\d{4}-\d+", result)
+        if cve_matches:
+            host = state_store.get_host_by_ip(target)
+            if not host:
+                host_id = state_store.add_host(HostEntity(ip_address=target))
+            else:
+                host_id = host.id
+            existing_vulns = state_store.get_vulnerabilities_for_host(host_id)
+            existing_cves = {v.cve_id for v in existing_vulns}
+            for cve in set(cve_matches):
+                if cve not in existing_cves:
+                    state_store.add_vulnerability(VulnerabilityEntity(
+                        host_id=host_id, cve_id=cve,
+                        description=f"Detected by {tool_name}",
+                    ))
+    except Exception as exc:
+        logger.debug("StateStore registration failed: %s", exc)
+
+
+# ツール登録時にラッパーで包む
+def _make_wrapper(original_func, tool_name):
+    def wrapper(**kwargs):
+        result = original_func(**kwargs)
+        result_str = str(result)
+        _post_tool_processing(tool_name, kwargs, result_str)
+        return result_str
+    return wrapper
+
+# 既存の登録ループを変更:
+# 旧: mcp.add_tool(fn)  — 直接登録
+# 新: mcp.add_tool(_make_wrapper(fn, tool_name))  — ラッパー経由で登録
+```
+
+**新規MCPツール: get_state_summary**
+
+```python
+def get_state_summary() -> str:
+    """Return current StateStore state: hosts, services, vulnerabilities."""
+    if not state_store:
+        return "StateStore is empty."
+    lines = []
+    for host in state_store.get_hosts():
+        services = state_store.get_services_for_host(host.id)
+        vulns = state_store.get_vulnerabilities_for_host(host.id)
+        svc_str = ", ".join(f"{s.port}/{s.service_name}" for s in services)
+        lines.append(f"{host.ip_address} ({host.hostname or '?'}): {svc_str}")
+        for v in vulns:
+            lines.append(f"  [{v.exploitation_status}] {v.cve_id}: {v.description[:60]}")
+    return "\n".join(lines) if lines else "No entities registered."
+
+# MCPツールとして登録
+mcp.add_tool(get_state_summary)
+```
+
+**検証手順**:
+
+1. ユニットテスト: `_post_tool_processing()` に実際のnmap出力（Phantom整形形式+標準形式）を渡し、StateStoreに正しくサービスが登録されることを確認。エラー出力でErrorHandlerが正しく分類されることを確認
+2. MCPツール検証: `get_state_summary` がStateStoreの現在の状態を正しく返すことを確認
+3. **統合テスト（Claude Code CLI経由）**: Claude Code CLIからMCPツール（run_nmap等）を呼出し、`get_state_summary`で登録結果を確認。ErrorHandlerのログがMCPサーバーのログに出力されることを確認
+4. 回帰テスト: 既存462テスト全パス + MCPブリッジで28ツール（27+get_state_summary）が登録されること
+
+---
+
+#### スプリント5: 事前バリデーション
+
+**目的**: ツール実行前にパラメータの妥当性とStateStoreとの整合性を検証する。Co-RedTeamのValidation Agent概念をプログラム的に実装する。MCPブリッジの `_post_tool_processing()` の**前**にバリデーションを挟む。
+
+**注**: Orchestrator統合テストはスプリント4（MCPブリッジ統合）で解決済み。Orchestratorの`_execute_tool()`/`_observe_phase()`への接続は不要（MCPブリッジが直接ErrorHandler/StateStoreを使用するため）。
+
+**新規ファイル**: `agent/execution/pre_validator.py`（~80行）
+
+**改修ファイル**: `mcp_bridge.py`（ラッパー関数にバリデーション追加）
+
+**依存**: StateStore（スプリント2）, MCPブリッジ統合（スプリント4）
 
 **事前バリデーション設計**:
 
@@ -1782,17 +1999,20 @@ class MemoryDistiller:
     │
 スプリント2: DB層 + StateStore ←── 依存なし ✅ 完了
     │
-スプリント3: ADツール ←── 延期（ADターゲット遭遇時に実施）
+スプリント3(旧4): EGATS コア ←── 依存なし ✅ 完了
     │
-スプリント3(旧4): EGATS コア ←── 依存なし（完全独立）← 次に実施
+スプリント4: MCPブリッジ統合 ←── ErrorHandler(Sprint1) + StateStore(Sprint2) ← **次に実施**
+    │  （ErrorHandler/StateStoreをMCPブリッジに直接組込み。Orchestrator経由ではない）
+    │  （get_state_summary MCPツール追加）
     │
-    ├── スプリント5: 事前バリデーション ←── StateStore (スプリント2)
+    ├── スプリント5: 事前バリデーション ←── MCPブリッジ統合 (スプリント4)
     │
     ├── スプリント6: 4層仮説生成 ←── StateStore (スプリント2)
     │
-    └── スプリント7: EGATS Forest + Orchestrator統合 ←── StateStore (スプリント2) + EGATS (スプリント4)
+    └── スプリント7: EGATS Forest + MCPブリッジ統合 ←── EGATS (スプリント3) + MCPブリッジ (スプリント4)
+         │  （注: OrchestratorではなくMCPブリッジにEGATSを組込む）
          │
-         └── スプリント8: LLMRouter ←── EGATS統合 (スプリント7) でTDI利用可能
+         └── スプリント8: LLMRouter ←── EGATS統合 (スプリント7)
               │
               └── スプリント9: RAG基盤 ←── 依存なし（PostgreSQL独自接続）
                    │
@@ -1801,7 +2021,7 @@ class MemoryDistiller:
                    └── スプリント11: 仮説第3層有効化 ←── RAG (スプリント9) + 4層仮説 (スプリント6)
 ```
 
-スプリント1〜2は完了済み。スプリント3（ADツール）は延期（ADターゲット遭遇時に実施）。スプリント3（旧4）のEGATSコアから再開。スプリント5以降は依存関係に従って順次実施する。
+スプリント1〜3は完了済み。ADツールは延期（ADターゲット遭遇時に実施）。スプリント4（MCPブリッジ統合）が次の実施対象。スプリント5以降は依存関係に従って順次実施する。
 
 各スプリント完了時のチェックリスト:
 - [ ] 新規コンポーネントのユニットテスト全パス
