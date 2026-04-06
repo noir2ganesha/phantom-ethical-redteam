@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Phantom MCP Bridge — thin router between Claude Code CLI and Phantom tool suite.
+"""Phantom MCP Bridge — routes Claude Code CLI tool calls through Phantom's
+tool suite with ErrorHandler classification and StateStore entity registration.
 
-This bridge does NOT contain any logic. It:
-  1. Imports Phantom's TOOL_REGISTRY and TOOL_SPECS
-  2. Registers each tool function with FastMCP (auto-generates MCP schema from type annotations)
-  3. Forwards calls directly to Phantom's existing tool functions
-  4. Returns results as-is
+Sprint 4: Integrated ErrorHandler (Sprint 1) and StateStore (Sprint 2) into
+the MCP bridge so that every tool execution is automatically:
+  1. Classified by ErrorHandler (error type + recovery suggestion logged)
+  2. Registered to StateStore (Host/Service/Vulnerability entities)
 
-All scope checking, validation, and error handling remains in Phantom's tool layer.
+The bridge remains a thin layer — all tool logic stays in Phantom's tools/.
 """
 
 import functools
 import inspect
 import logging
 import os
+import re
 import sys
 
 # Ensure Phantom's agent/ directory is importable
@@ -28,6 +29,152 @@ logger = logging.getLogger("phantom.mcp_bridge")
 
 # Import Phantom tool registry
 from tools import TOOL_REGISTRY, TOOL_SPECS
+
+# ---------------------------------------------------------------------------
+# ErrorHandler (Sprint 1) — classify tool errors automatically
+# ---------------------------------------------------------------------------
+try:
+    from execution.error_handler import ErrorHandler, ErrorType
+
+    _error_handler = ErrorHandler()
+    logger.info("ErrorHandler loaded")
+except Exception as exc:
+    logger.warning("ErrorHandler not available: %s", exc)
+    _error_handler = None
+    ErrorType = None
+
+# ---------------------------------------------------------------------------
+# StateStore (Sprint 2) — register discovered entities automatically
+# ---------------------------------------------------------------------------
+try:
+    from memory.state_store import StateStore
+    from memory.entity_models import HostEntity, ServiceEntity, VulnerabilityEntity
+
+    PHANTOM_DIR = os.path.expanduser("~/.phantom")
+    os.makedirs(PHANTOM_DIR, exist_ok=True)
+    _state_store = StateStore(db_path=os.path.join(PHANTOM_DIR, "state_store.db"))
+    logger.info("StateStore loaded: %s", os.path.join(PHANTOM_DIR, "state_store.db"))
+except Exception as exc:
+    logger.warning("StateStore not available: %s", exc)
+    _state_store = None
+
+# ---------------------------------------------------------------------------
+# Post-tool processing: ErrorHandler + StateStore
+# ---------------------------------------------------------------------------
+
+# nmap output parsing patterns
+_NMAP_STANDARD = re.compile(r"(\d+)/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)")
+_NMAP_PHANTOM = re.compile(r"(\d+)/(tcp|udp)\s+(\S+)\s+(.*)")
+_CVE_PATTERN = re.compile(r"CVE-\d{4}-\d+")
+
+_ERROR_KEYWORDS = frozenset(["error", "fail", "denied", "refused", "timeout",
+                              "timed out", "unreachable", "blocked"])
+
+
+def _post_tool_processing(tool_name: str, tool_input: dict, result: str) -> None:
+    """Run ErrorHandler classification and StateStore registration after tool execution."""
+
+    # --- ErrorHandler ---
+    if _error_handler and result:
+        _lower = result.lower()[:200]
+        if any(kw in _lower for kw in _ERROR_KEYWORDS):
+            error_type = _error_handler.classify(result, tool_name)
+            if error_type != ErrorType.UNKNOWN:
+                recovery = _error_handler.recover(error_type, {"tool": tool_name})
+                logger.info(
+                    "ErrorHandler: %s -> %s: %s",
+                    error_type.value,
+                    recovery.action.value,
+                    recovery.suggestion,
+                )
+
+    # --- StateStore ---
+    if not _state_store:
+        return
+    if result.startswith("Error") or result.startswith("SCOPE VIOLATION"):
+        return
+
+    target = tool_input.get("target", tool_input.get("url", ""))
+    if not target:
+        return
+
+    try:
+        # nmap → Host + Service
+        if tool_name == "run_nmap":
+            host = _state_store.get_host_by_ip(target)
+            if not host:
+                host_id = _state_store.add_host(HostEntity(ip_address=target))
+            else:
+                host_id = host.id
+
+            for line in result.splitlines():
+                port, proto, svc, ver = None, None, None, None
+                # Pattern 1: nmap standard (port/tcp open service version)
+                m = _NMAP_STANDARD.match(line.strip())
+                if m:
+                    port, proto, svc, ver = m.group(1), m.group(2), m.group(4), m.group(5)
+                else:
+                    # Pattern 2: Phantom formatted (port/tcp service version)
+                    m = _NMAP_PHANTOM.match(line.strip())
+                    if m:
+                        port, proto, svc, ver = m.group(1), m.group(2), m.group(3), m.group(4)
+
+                if port:
+                    p = int(port)
+                    existing = _state_store.get_services_for_host(host_id)
+                    if not any(s.port == p and s.protocol == proto for s in existing):
+                        _state_store.add_service(ServiceEntity(
+                            host_id=host_id,
+                            port=p,
+                            protocol=proto,
+                            service_name=svc,
+                            version=(ver.strip() if ver else None),
+                        ))
+
+        # All tools: CVE ID detection → Vulnerability registration
+        cve_matches = _CVE_PATTERN.findall(result)
+        if cve_matches and target:
+            host = _state_store.get_host_by_ip(target)
+            if not host:
+                host_id = _state_store.add_host(HostEntity(ip_address=target))
+            else:
+                host_id = host.id
+            existing_vulns = _state_store.get_vulnerabilities_for_host(host_id)
+            existing_cves = {v.cve_id for v in existing_vulns}
+            for cve in set(cve_matches):
+                if cve not in existing_cves:
+                    _state_store.add_vulnerability(VulnerabilityEntity(
+                        host_id=host_id,
+                        cve_id=cve,
+                        description=f"Detected by {tool_name}",
+                    ))
+
+    except Exception as exc:
+        logger.debug("StateStore registration failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# get_state_summary — new MCP tool for querying StateStore
+# ---------------------------------------------------------------------------
+
+def get_state_summary() -> str:
+    """Return current StateStore state: hosts, services, vulnerabilities discovered so far."""
+    if not _state_store:
+        return "StateStore is not available."
+    lines = []
+    for host in _state_store.get_hosts():
+        services = _state_store.get_services_for_host(host.id)
+        vulns = _state_store.get_vulnerabilities_for_host(host.id)
+        svc_str = ", ".join(f"{s.port}/{s.service_name}" for s in services)
+        lines.append(f"{host.ip_address} ({host.hostname or '?'}): {svc_str}")
+        for v in vulns:
+            lines.append(f"  [{v.exploitation_status}] {v.cve_id}: {v.description[:60]}")
+    return "\n".join(lines) if lines else "No entities registered yet."
+
+
+# ---------------------------------------------------------------------------
+# FastMCP server setup
+# ---------------------------------------------------------------------------
 
 mcp = FastMCP("Phantom Security Tools")
 
@@ -46,11 +193,7 @@ def _needs_kwargs_wrapper(func) -> bool:
 
 
 def _strip_kwargs(func):
-    """Create a wrapper that accepts only the explicit parameters (no **kwargs).
-
-    FastMCP cannot handle **kwargs. We build a wrapper with a fixed signature
-    that mirrors the original's typed parameters, dropping **kwargs.
-    """
+    """Create a wrapper that accepts only the explicit parameters (no **kwargs)."""
     sig = inspect.signature(func)
     explicit_params = [
         p
@@ -64,6 +207,19 @@ def _strip_kwargs(func):
         return func(*args, **kwargs)
 
     wrapper.__signature__ = new_sig
+    return wrapper
+
+
+def _make_tool_wrapper(original_func, tool_name: str):
+    """Wrap a tool function with post-processing (ErrorHandler + StateStore)."""
+
+    @functools.wraps(original_func)
+    def wrapper(**kwargs):
+        result = original_func(**kwargs)
+        result_str = str(result)
+        _post_tool_processing(tool_name, kwargs, result_str)
+        return result_str
+
     return wrapper
 
 
@@ -81,6 +237,9 @@ for tool_name, tool_func in TOOL_REGISTRY.items():
     if _needs_kwargs_wrapper(fn):
         fn = _strip_kwargs(fn)
 
+    # Wrap with post-processing (ErrorHandler + StateStore)
+    fn = _make_tool_wrapper(fn, tool_name)
+
     # Set metadata that FastMCP reads
     fn.__name__ = tool_name
     fn.__qualname__ = tool_name
@@ -93,7 +252,13 @@ for tool_name, tool_func in TOOL_REGISTRY.items():
     except Exception as exc:
         logger.error("Failed to register %s: %s", tool_name, exc)
 
-logger.info("MCP bridge ready: %d tools registered", len(_registered))
+# Register get_state_summary as an additional MCP tool
+get_state_summary.__name__ = "get_state_summary"
+get_state_summary.__qualname__ = "get_state_summary"
+mcp.add_tool(get_state_summary)
+_registered.add("get_state_summary")
+
+logger.info("MCP bridge ready: %d tools registered (including get_state_summary)", len(_registered))
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
