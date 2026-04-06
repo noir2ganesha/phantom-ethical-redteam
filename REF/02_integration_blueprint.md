@@ -1178,15 +1178,61 @@ self._state_store = StateStore(db_path=session_db_path)
 self._register_to_state_store(tool_name, tc.get("input", {}), content, findings)
 ```
 
-**ツール結果のStateStore登録は段階的に対応する**:
+**全27ツールのStateStore登録対応計画**:
 
-| スプリント | 対応ツール | 登録エンティティ |
-|---|---|---|
-| スプリント2 | run_nmap | Host + Service（ポート行の正規表現パース） |
-| スプリント2 | run_nuclei | Vulnerability（CVE行のパース） |
-| スプリント6 | run_whatweb | Service.version の更新 |
-| スプリント6 | run_sqlmap, run_wpscan | Vulnerability |
-| スプリント7 | run_hydra, forge_tool | Credential, Session |
+StateStoreは5エンティティ（Host, Service, Vulnerability, Credential, Session）を管理する。全27ツールの出力がどのエンティティに対応するかを以下に分類する。ツール対応は段階的に実装し、各スプリントで対応するツールのみを追加する。
+
+**スプリント2で対応（偵察基盤 — 最小限の2ツール）**:
+
+| ツール | 出力に含まれる情報 | 登録エンティティ | パース方法 |
+|---|---|---|---|
+| `run_nmap` | IPアドレス、ポート番号、プロトコル、サービス名、バージョン、OS推定 | **Host** + **Service** | ポート行の正規表現（`\d+/(tcp|udp)\s+(open|filtered)\s+(\S+)\s*(.*)`） |
+| `run_nuclei` | CVE番号、重要度、対象URL、脆弱性説明 | **Vulnerability** | 既存`_extract_findings()`のFinding.cve_idから二次登録 |
+
+**スプリント6で対応（偵察拡張+脆弱性スキャン — 6ツール）**:
+
+| ツール | 出力に含まれる情報 | 登録エンティティ | パース方法 |
+|---|---|---|---|
+| `run_whatweb` | テクノロジー（CMS、フレームワーク、サーバー種別/バージョン） | **Service.version の更新**（既存サービスに技術情報を追記） | 既存ツール出力のキーワードマッチ |
+| `run_recon` | サブドメイン一覧（CRT.sh、HackerTarget） | **Host**（発見したサブドメインをホストとして登録） | 出力行からドメイン名を抽出 |
+| `run_ffuf` | vhostサブドメイン / ディレクトリパス | vhost使用時: **Host**（サブドメイン登録）。ディレクトリ: StateStore対象外（Findingとして既存MissionMemoryに記録） | ffuf JSON出力のHost行を判定 |
+| `run_sqlmap` | 脆弱パラメータ名、攻撃種別（UNION/blind/time-based）、DB名、テーブル名 | **Vulnerability**（CVE番号なし、descriptionにパラメータ名+攻撃種別を記録） | 「is vulnerable」「Type:」行のパース |
+| `run_wpscan` | WPバージョン、ユーザー名列挙、プラグイン脆弱性CVE | **Vulnerability** + **Credential**（ユーザー名列挙結果、credential_type="username_only"） | WPScan出力のセクション別パース |
+| `run_graphql_enum` | GraphQLスキーマ、イントロスペクション有無、機密フィールド | **Vulnerability**（イントロスペクション有効=設定ミスとして登録） | 「introspection enabled」等のキーワード |
+
+**スプリント7で対応（エクスプロイト+横展開 — 6ツール）**:
+
+| ツール | 出力に含まれる情報 | 登録エンティティ | パース方法 |
+|---|---|---|---|
+| `run_hydra` | 有効なユーザー名:パスワード | **Credential**（credential_type="password"、valid_for=[host_id]） | 「login:」「password:」行のパース |
+| `run_jwt_attacks` | JWTトークン、弱シークレット、偽造トークン | **Credential**（credential_type="jwt_token" or "jwt_secret"） | 「Secret:」「Token:」行のパース |
+| `run_metasploit` | セッション取得結果、Meterpreterシェル | **Session**（session_type="meterpreter" or "shell"） + **Credential** | 「session opened」行のパース |
+| `fetch_exploit` | PoC実行結果、エクスプロイト成功/失敗 | **Vulnerability.exploitation_status の更新**（"discovered"→"exploited"） | 実行結果のキーワード判定 |
+| `forge_tool` | カスタムスクリプト実行結果（シェル取得、ファイル読取等） | **Session**（シェル取得時） + **Credential**（クレデンシャル発見時） | 出力内容によりパターンマッチ（「shell」「password」「token」等） |
+| `run_privesc_check` | SUID/sudo/cron列挙結果、権限昇格パス | **Vulnerability**（exploitation_status="privesc_path"） | SUID行、sudo行のパース |
+| `run_bettercap` | ネットワークプローブで発見したホスト | **Host** | ARP応答からIP+MACアドレス抽出 |
+
+**StateStore対象外のツール（15ツール）**:
+
+以下のツールはHost/Service/Vulnerability/Credential/Sessionのいずれにも直接対応するデータを出力しないため、StateStoreへの登録は行わない。これらの出力は既存のMissionMemory（Finding/ActionRecord）で引き続き管理される。
+
+| ツール | 理由 |
+|---|---|
+| `check_scope` | スコープ判定結果。エンティティではない |
+| `configure_auth` | 認証設定操作。発見ではない |
+| `set_stealth_profile` | プロファイル変更。発見ではない |
+| `take_screenshot` | 証拠画像パス。エンティティではない |
+| `generate_report` | レポート生成。エンティティではない |
+| `read_log` | ログ表示。新しい情報ではない |
+| `calculate_risk_score` | スコア計算。エンティティではない |
+| `compare_missions` | セッション差分。エンティティではない |
+| `run_payloads` | ペイロードリスト提供。発見ではない |
+| `cleanup_temp` | ファイル削除。発見ではない |
+| `request_human_input` | 人間の応答。エンティティではない |
+| `generate_phish_template` | テンプレート生成。エンティティではない |
+| `generate_zphisher_template` | テンプレート生成。エンティティではない |
+
+**注: niktoについて**: Phantomの27ツールにniktoは含まれていない。niktoの機能はnuclei（CVE/設定ミススキャン）とwhatweb（テクノロジー検出）でカバーされている。将来的にniktoを追加する場合は、run_nucleiと同じVulnerabilityエンティティへの登録パターンを使用する。
 
 スプリント2ではnmapとnucleiのみに対応する。これらは既存の `_extract_findings_from_tool_output()` が既にパースしている情報を、StateStoreのエンティティとして二次的に登録する形で実装する。新しいパーサーは書かない。
 
